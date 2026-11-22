@@ -1,0 +1,33 @@
+#!/bin/sh
+# Ouvre /sys/devices/platform/vhci_hcd.0/attach et detach au groupe de
+# l'utilisateur de Sunshine, pour que Sunshine branche la DualSense en USB/IP
+# sans root. Lancé par le oneshot s6 init-sunshine-ds-vhci. Toujours exit 0 :
+# sans vhci-hcd utilisable, Sunshine retombe sur uhid.
+#
+# Usage : vhci-permissions [groupe]   (défaut : input)
+set -u
+
+GROUP=${1:-input}
+D=/sys/devices/platform/vhci_hcd.0
+
+log() {
+    echo "[vhci-permissions] $*"
+}
+
+if [ ! -d "$D" ]; then
+    log "vhci-hcd absent, DualSense USB/IP unavailable (uhid fallback)"
+    exit 0
+fi
+
+# Montage en lecture seule : rien à faire, on ne peut pas écrire dans sysfs.
+if [ ! -w "$D/attach" ]; then
+    log "$D/attach not writable (read-only mount), uhid fallback"
+    exit 0
+fi
+
+if chgrp "$GROUP" "$D/attach" "$D/detach" && chmod 0220 "$D/attach" "$D/detach"; then
+    log "attach/detach owned by group $GROUP (mode 0220)"
+else
+    log "chgrp/chmod failed on $D, uhid fallback"
+fi
+exit 0
