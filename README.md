@@ -26,7 +26,7 @@ Une archive à décompresser à la racine du système cible :
   (mode 0220), en sortant sans erreur si `vhci-hcd` est absent ou en lecture
   seule ;
 - `etc/s6-overlay/s6-rc.d/init-sunshine-ds-vhci/` : oneshot s6 qui lance ce
-  script au démarrage, et son entrée dans `s6-rc.d/user/contents.d/`.
+  script au démarrage, et son entrée dans `user-bundles.d/user/contents.d/`.
 
 Les archives portent le nom `sunshine-ds.tar.zst`, avec `sunshine-ds.version`
 (une ligne : tag Sunshine, sha7 de libvirtualhid et de ds5-usbip) et
