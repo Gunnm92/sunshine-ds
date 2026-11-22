@@ -6,8 +6,12 @@ DOCKER ?= env -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH DOCKER_HOST=tcp://docker-
 REPO ?= Gunnm92/sunshine-ds
 
 # Arguments de build, passés seulement s'ils sont définis.
-SUNSHINE_TAG ?=
-DS5_USBIP_REF ?=
+# Références résolues AVANT le build (dernier tag v* de Sunshine, commit de la
+# branche main de ds5-usbip) : passées en arguments, elles changent la clé de
+# cache de l'étape src dès qu'elles bougent. Sans ça, `git clone … main` en
+# cache garderait un ancien ds5-usbip (vu le 22/11).
+SUNSHINE_TAG ?= $(shell git ls-remote --tags --refs https://github.com/LizardByte/Sunshine.git 'v*' | sed 's|.*refs/tags/||' | sort -V | tail -1)
+DS5_USBIP_REF ?= $(shell git ls-remote https://github.com/Gunnm92/ds5-usbip.git refs/heads/main | cut -f1)
 LVH_COMMIT ?=
 REQUIRE_USBIP ?=
 BUILD_ARGS := \
