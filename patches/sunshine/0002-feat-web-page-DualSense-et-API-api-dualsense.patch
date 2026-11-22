@@ -1,0 +1,738 @@
+From 6dad38cd1e043367d3a68890451a0fe425a41f21 Mon Sep 17 00:00:00 2001
+From: Gunnm92 <gunnm44@gmail.com>
+Date: Sun, 22 Nov 2026 23:49:41 +0100
+Subject: [PATCH 2/2] feat(web): page DualSense et API /api/dualsense
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- GET /api/dualsense : réglages (gain, canaux) et état du pilote
+  (fichier LIBVIRTUALHID_DUALSENSE_STATUS, sinon {"attached": false}).
+- POST /api/dualsense {"gain", "channels"} : validation (0 < gain <= 64,
+  canaux 2 ou 4), écriture atomique du fichier de réglages.
+  Authentification et CSRF comme les autres points de /api/config.
+- Page Vue « DualSense » (entrée de menu et route) : état, niveaux des
+  quatre canaux, réglage des canaux et du gain.
+- Libellés en anglais (défaut) et en français.
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+
+diff --git a/src/confighttp.cpp b/src/confighttp.cpp
+index 7a5f0c6..58cbe80 100644
+--- a/src/confighttp.cpp
++++ b/src/confighttp.cpp
+@@ -48,6 +48,7 @@
+ #include "confighttp.h"
+ #include "crypto.h"
+ #include "display_device.h"
++#include "dualsense_settings.h"
+ #include "file_handler.h"
+ #include "globals.h"
+ #include "httpcommon.h"
+@@ -2278,6 +2279,59 @@ namespace confighttp {
+     send_response(response, output_tree);
+   }
+ 
++  /**
++   * @brief Get the DualSense haptics settings and the libvirtualhid driver status.
++   * @param response HTTP response used for authentication and output.
++   * @param request Authenticated HTTP request.
++   *
++   * @api_examples{/api/dualsense|:| GET|:| null}
++   */
++  void getDualsense(const resp_https_t &response, const req_https_t &request) {
++    if (!authenticate(response, request)) {
++      return;
++    }
++
++    print_req(request);
++    send_response(response, dualsense::get_state());
++  }
++
++  /**
++   * @brief Save the DualSense haptics settings (gain and channel count) to the settings file.
++   * @param response HTTP response used for authentication, CSRF, validation and output.
++   * @param request HTTP request carrying the JSON body {"gain": F, "channels": 2|4}.
++   *
++   * @api_examples{/api/dualsense|:| POST|:| {"gain":1.5,"channels":4}}
++   */
++  void saveDualsense(const resp_https_t &response, const req_https_t &request) {
++    if (!check_content_type(response, request, "application/json")) {
++      return;
++    }
++    if (!authenticate(response, request)) {
++      return;
++    }
++
++    std::string client_id = get_client_id(request);
++    if (!validate_csrf_token(response, request, client_id)) {
++      return;
++    }
++
++    print_req(request);
++
++    std::stringstream ss;
++    ss << request->content.rdbuf();
++    std::string error;
++    const auto settings = dualsense::save_settings(ss.str(), error);
++    if (!settings) {
++      bad_request(response, error);
++      return;
++    }
++
++    nlohmann::json output_tree;
++    output_tree["status"] = true;
++    output_tree["settings"] = *settings;
++    send_response(response, output_tree);
++  }
++
+   /**
+    * @brief Get the current libvirtualhid machine license status.
+    *
+@@ -2606,6 +2660,8 @@ namespace confighttp {
+     server.resource["^/api/virtual-input/license$"]["GET"] = getVirtualInputLicense;
+     server.resource["^/api/virtual-input/license$"]["POST"] = updateVirtualInputLicense;
+     server.resource["^/api/virtual-input/status$"]["GET"] = getVirtualInputStatus;
++    server.resource["^/api/dualsense$"]["GET"] = getDualsense;
++    server.resource["^/api/dualsense$"]["POST"] = saveDualsense;
+ 
+     // static/dynamic resources
+     server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;
+diff --git a/src/dualsense_settings.cpp b/src/dualsense_settings.cpp
+index ae429a6..a2a89f7 100644
+--- a/src/dualsense_settings.cpp
++++ b/src/dualsense_settings.cpp
+@@ -1,11 +1,15 @@
+ /**
+  * @file src/dualsense_settings.cpp
+- * @brief Startup environment of the DualSense haptics files (libvirtualhid).
++ * @brief Settings file, status file and startup environment for the DualSense haptics (libvirtualhid).
+  */
+ // standard includes
++#include <charconv>
+ #include <filesystem>
+-#include <string>
++#include <format>
++#include <fstream>
++#include <sstream>
+ #include <string_view>
++#include <system_error>
+ 
+ // lib includes
+ #include <lizardbyte/common/env.h>
+@@ -21,10 +25,162 @@ namespace dualsense {
+ 
+     constexpr auto settings_env = "LIBVIRTUALHID_DUALSENSE_SETTINGS"sv;  ///< Settings file read by the driver.
+     constexpr auto status_env = "LIBVIRTUALHID_DUALSENSE_STATUS"sv;  ///< Status file written by the driver.
++    constexpr auto channels_env = "LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS"sv;  ///< Default channel count (2 or 4).
++    constexpr double gain_default = 1.0;  ///< Gain used when the settings file has none.
++    constexpr double gain_max = 64.0;  ///< Upper bound of the driver gain (exclusive lower bound 0).
++
++    /**
++     * @brief Haptics settings: gain (0 < gain <= 64) and channel count (2 or 4).
++     */
++    struct settings_t {
++      double gain {gain_default};  ///< Haptics gain.
++      int channels {2};  ///< 2 = haptics only, 4 = speaker + haptics.
++    };
++
++    bool valid_gain(double gain) {
++      return gain > 0.0 && gain <= gain_max;
++    }
++
++    bool valid_channels(int channels) {
++      return channels == 2 || channels == 4;
++    }
+ 
+     std::string env_value(std::string_view name) {
+       return lizardbyte::common::get_env(std::string {name});
+     }
++
++    std::optional<std::string> read_text(const std::string &path) {
++      if (path.empty()) {
++        return std::nullopt;
++      }
++      std::ifstream in {path, std::ios::binary};
++      if (!in) {
++        return std::nullopt;
++      }
++      std::ostringstream buffer;
++      buffer << in.rdbuf();
++      return buffer.str();
++    }
++
++    std::string_view trim(std::string_view text) {
++      const auto first = text.find_first_not_of(" \t\r\n");
++      if (first == std::string_view::npos) {
++        return {};
++      }
++      const auto last = text.find_last_not_of(" \t\r\n");
++      return text.substr(first, last - first + 1);
++    }
++
++    /**
++     * @brief Defaults used when the settings file is missing or a key is invalid.
++     */
++    settings_t default_settings() {
++      settings_t settings;
++      int channels = 0;
++      const auto text = env_value(channels_env);
++      const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), channels);
++      if (ec == std::errc {} && end == text.data() + text.size() && valid_channels(channels)) {
++        settings.channels = channels;
++      }
++      return settings;
++    }
++
++    /**
++     * @brief Read key=value lines ('#' comments) from the settings file, falling back to defaults per key.
++     */
++    settings_t read_settings() {
++      auto settings = default_settings();
++      const auto text = read_text(env_value(settings_env));
++      if (!text) {
++        return settings;
++      }
++
++      std::istringstream lines {*text};
++      std::string raw;
++      while (std::getline(lines, raw)) {
++        const auto line = trim(raw);
++        if (line.empty() || line.front() == '#') {
++          continue;
++        }
++        const auto eq = line.find('=');
++        if (eq == std::string_view::npos) {
++          continue;
++        }
++        const auto key = trim(line.substr(0, eq));
++        const auto value = trim(line.substr(eq + 1));
++
++        if (key == "gain"sv) {
++          double gain = 0.0;
++          const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), gain);
++          if (ec == std::errc {} && end == value.data() + value.size() && valid_gain(gain)) {
++            settings.gain = gain;
++          }
++        } else if (key == "channels"sv) {
++          int channels = 0;
++          const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), channels);
++          if (ec == std::errc {} && end == value.data() + value.size() && valid_channels(channels)) {
++            settings.channels = channels;
++          }
++        }
++      }
++      return settings;
++    }
++
++    /**
++     * @brief Settings file content, in the key=value form read by libvirtualhid.
++     */
++    std::string render_settings(const settings_t &settings) {
++      return std::format(
++        "# Sunshine DualSense haptics settings (Web UI page DualSense).\n"
++        "# gain: haptics gain, reloaded by the driver every second (0 < gain <= 64).\n"
++        "# channels: 2 = haptics only, 4 = speaker + haptics, applied at the next connection.\n"
++        "gain={}\n"
++        "channels={}\n",
++        settings.gain,
++        settings.channels
++      );
++    }
++
++    /**
++     * @brief Write a file through a temporary sibling and rename it over the target.
++     */
++    bool write_atomic(const std::string &path, const std::string &content, std::string &error) {
++      const auto target = std::filesystem::path {path};
++      const auto temporary = std::filesystem::path {path + ".tmp"};
++      {
++        std::ofstream out {temporary, std::ios::binary | std::ios::trunc};
++        out << content;
++        out.flush();
++        if (!out) {
++          error = "Cannot write the DualSense settings file";
++          std::error_code ec;
++          std::filesystem::remove(temporary, ec);
++          return false;
++        }
++      }
++
++      std::error_code ec;
++      std::filesystem::rename(temporary, target, ec);
++      if (ec) {
++        error = "Cannot replace the DualSense settings file: "s + ec.message();
++        std::filesystem::remove(temporary, ec);
++        return false;
++      }
++      return true;
++    }
++
++    /**
++     * @brief Driver status file content, or {"attached": false} when absent or unreadable.
++     */
++    nlohmann::json read_status() {
++      const auto fallback = nlohmann::json {{"attached", false}};
++      const auto text = read_text(env_value(status_env));
++      if (!text) {
++        return fallback;
++      }
++      auto status = nlohmann::json::parse(*text, nullptr, false);
++      return status.is_object() ? status : fallback;
++    }
+   }  // namespace
+ 
+   void init_environment(const std::string &config_file) {
+@@ -42,4 +198,57 @@ namespace dualsense {
+     }
+   }
+ 
++  nlohmann::json get_state() {
++    const auto settings = read_settings();
++
++    nlohmann::json state;
++    state["settings"] = {{"gain", settings.gain}, {"channels", settings.channels}};
++    state["status"] = read_status();
++    return state;
++  }
++
++  std::optional<nlohmann::json> save_settings(const std::string &body, std::string &error) {
++    const auto request = nlohmann::json::parse(body, nullptr, false);
++    if (request.is_discarded() || !request.is_object()) {
++      error = "Invalid JSON body";
++      return std::nullopt;
++    }
++
++    const auto gain_it = request.find("gain");
++    if (gain_it == request.end() || !gain_it->is_number()) {
++      error = "gain must be a number";
++      return std::nullopt;
++    }
++    settings_t settings;
++    settings.gain = gain_it->get<double>();
++    if (!valid_gain(settings.gain)) {
++      error = "gain must be greater than 0 and at most 64";
++      return std::nullopt;
++    }
++
++    const auto channels_it = request.find("channels");
++    if (channels_it == request.end() || !channels_it->is_number_integer()) {
++      error = "channels must be 2 or 4";
++      return std::nullopt;
++    }
++    settings.channels = channels_it->get<int>();
++    if (!valid_channels(settings.channels)) {
++      error = "channels must be 2 or 4";
++      return std::nullopt;
++    }
++
++    const auto path = env_value(settings_env);
++    if (path.empty()) {
++      error = "LIBVIRTUALHID_DUALSENSE_SETTINGS is not set";
++      return std::nullopt;
++    }
++    if (!write_atomic(path, render_settings(settings), error)) {
++      BOOST_LOG(warning) << "DualSense settings: "sv << error;
++      return std::nullopt;
++    }
++
++    BOOST_LOG(info) << "DualSense settings saved: gain="sv << settings.gain << " channels="sv << settings.channels;
++    return nlohmann::json {{"gain", settings.gain}, {"channels", settings.channels}};
++  }
++
+ }  // namespace dualsense
+diff --git a/src/dualsense_settings.h b/src/dualsense_settings.h
+index cee50d1..f961d55 100644
+--- a/src/dualsense_settings.h
++++ b/src/dualsense_settings.h
+@@ -1,12 +1,16 @@
+ /**
+  * @file src/dualsense_settings.h
+- * @brief DualSense haptics settings and status files shared with libvirtualhid.
++ * @brief DualSense haptics settings and status shared with libvirtualhid, for the Web UI "DualSense" page.
+  */
+ #pragma once
+ 
+ // standard includes
++#include <optional>
+ #include <string>
+ 
++// lib includes
++#include <nlohmann/json.hpp>
++
+ namespace dualsense {
+ 
+   /**
+@@ -18,4 +22,20 @@ namespace dualsense {
+    */
+   void init_environment(const std::string &config_file);
+ 
++  /**
++   * @brief Current settings (file or defaults) and the driver status (file or detached).
++   *
++   * @return {"settings": {"gain": F, "channels": 2|4}, "status": <status file content or {"attached": false}>}
++   */
++  nlohmann::json get_state();
++
++  /**
++   * @brief Validate a settings request and rewrite the settings file atomically.
++   *
++   * @param body JSON body: {"gain": F, "channels": 2|4}.
++   * @param error Set to a client-facing message when the request is refused.
++   * @return The saved settings, or std::nullopt when refused or the file cannot be written.
++   */
++  std::optional<nlohmann::json> save_settings(const std::string &body, std::string &error);
++
+ }  // namespace dualsense
+diff --git a/src_assets/common/assets/web/DualSense.vue b/src_assets/common/assets/web/DualSense.vue
+new file mode 100644
+index 0000000..e9665e4
+--- /dev/null
++++ b/src_assets/common/assets/web/DualSense.vue
+@@ -0,0 +1,205 @@
++<template>
++  <Navbar></Navbar>
++  <div id="content" class="container">
++    <h1 class="my-4">{{ $t('dualsense.title') }}</h1>
++    <p class="text-body-secondary">{{ $t('dualsense.intro') }}</p>
++
++    <div class="card mb-4">
++      <div class="card-body">
++        <h2 class="h5 d-flex align-items-center gap-2">
++          <gamepad-2 :size="20" aria-hidden="true"></gamepad-2>
++          {{ $t('dualsense.status') }}
++        </h2>
++        <div v-if="loadError" class="alert alert-danger" role="alert">{{ $t('dualsense.load_failure') }}</div>
++        <p>
++          <span class="badge" :class="attached ? 'text-bg-success' : 'text-bg-secondary'">
++            {{ $t(attached ? 'dualsense.attached' : 'dualsense.detached') }}
++          </span>
++        </p>
++        <dl class="row mb-0">
++          <dt class="col-sm-4">{{ $t('dualsense.vhci_port') }}</dt>
++          <dd class="col-sm-8">{{ status.vhci_port ?? '-' }}</dd>
++          <dt class="col-sm-4">{{ $t('dualsense.destination') }}</dt>
++          <dd class="col-sm-8">{{ status.destination || $t('dualsense.no_destination') }}</dd>
++          <dt class="col-sm-4">{{ $t('dualsense.channels') }}</dt>
++          <dd class="col-sm-8">{{ status.channels ?? '-' }}</dd>
++          <dt class="col-sm-4">{{ $t('dualsense.gain') }}</dt>
++          <dd class="col-sm-8">{{ status.gain !== undefined ? Number(status.gain).toFixed(2) : '-' }}</dd>
++          <dt class="col-sm-4">{{ $t('dualsense.packets') }}</dt>
++          <dd class="col-sm-8 mb-0">{{ status.packets ?? '-' }}</dd>
++        </dl>
++      </div>
++    </div>
++
++    <div class="card mb-4">
++      <div class="card-body">
++        <h2 class="h5">{{ $t('dualsense.level') }}</h2>
++        <div v-for="(level, index) in levels" :key="index" class="d-flex align-items-center gap-3 mb-2">
++          <span class="dualsense-level-label">{{ $t(levelLabels[index]) }}</span>
++          <div class="progress flex-grow-1" role="meter" :aria-label="$t(levelLabels[index])"
++               :aria-valuemin="-60" :aria-valuemax="0" :aria-valuenow="Math.max(-60, Math.min(0, level.db))">
++            <div class="progress-bar" :style="{width: level.percent + '%'}"></div>
++          </div>
++          <span class="dualsense-level-db text-end">{{ level.db > -120 ? level.db.toFixed(1) + ' dB' : '-' }}</span>
++        </div>
++      </div>
++    </div>
++
++    <form class="card mb-4" @submit.prevent="save">
++      <div class="card-body">
++        <h2 class="h5">{{ $t('dualsense.settings') }}</h2>
++        <div class="mb-3">
++          <label for="dualsense-channels" class="form-label">{{ $t('dualsense.channels') }}</label>
++          <select id="dualsense-channels" v-model.number="form.channels" class="form-select">
++            <option :value="2">{{ $t('dualsense.channels_2') }}</option>
++            <option :value="4">{{ $t('dualsense.channels_4') }}</option>
++          </select>
++          <div class="form-text">{{ $t('dualsense.channels_note') }}</div>
++        </div>
++        <div class="mb-3">
++          <label for="dualsense-gain" class="form-label d-flex justify-content-between">
++            <span>{{ $t('dualsense.gain') }}</span>
++            <output for="dualsense-gain">{{ Number(form.gain).toFixed(2) }}</output>
++          </label>
++          <input id="dualsense-gain" v-model.number="form.gain" type="range" class="form-range"
++                 min="0" max="4" step="0.05">
++          <div class="form-text">{{ $t('dualsense.gain_note') }}</div>
++        </div>
++        <button type="submit" class="btn btn-primary" :disabled="saving">
++          <save :size="18" class="icon"></save>
++          {{ $t('dualsense.save') }}
++        </button>
++        <div v-if="message" :class="`alert alert-${message.type} mt-3 mb-0`" role="alert">{{ message.text }}</div>
++      </div>
++    </form>
++  </div>
++</template>
++
++<script>
++  import Navbar from './Navbar.vue'
++  import { apiFetch } from './fetch_utils'
++  import { Gamepad2, Save } from '@lucide/vue'
++
++  /** Driver peak meter floor and ceiling, in dB. */
++  const METER_MIN_DB = -60
++
++  export default {
++    components: {
++      Navbar,
++      Gamepad2,
++      Save,
++    },
++    inject: ['i18n'],
++    data() {
++      return {
++        status: {attached: false},
++        form: {channels: 2, gain: 1},
++        formLoaded: false,
++        levels: [0, 1, 2, 3].map(() => ({db: -120, percent: 0})),
++        levelLabels: [
++          'dualsense.level_speaker_left',
++          'dualsense.level_speaker_right',
++          'dualsense.level_haptics_left',
++          'dualsense.level_haptics_right',
++        ],
++        loadError: false,
++        message: null,
++        pollTimer: null,
++        saving: false,
++      };
++    },
++    computed: {
++      attached() {
++        return this.status.attached === true;
++      },
++    },
++    mounted() {
++      this.load();
++      this.pollTimer = window.setInterval(() => this.load(), 1000);
++    },
++    beforeUnmount() {
++      window.clearInterval(this.pollTimer);
++    },
++    methods: {
++      /**
++       * Refresh the driver status and, on first load, the saved settings.
++       */
++      async load() {
++        try {
++          const response = await apiFetch('./api/dualsense', {method: 'GET'});
++          if (!response.ok) {
++            throw new Error(`HTTP ${response.status}`);
++          }
++
++          const body = await response.json();
++          this.loadError = false;
++          this.status = body.status || {attached: false};
++          if (!this.formLoaded && body.settings) {
++            this.form = {channels: body.settings.channels, gain: body.settings.gain};
++            this.formLoaded = true;
++          }
++          this.updateLevels(this.status.peak_db);
++        } catch (error) {
++          console.error('Failed to load DualSense status', error);
++          this.loadError = true;
++        }
++      },
++
++      /**
++       * Map the four peak values (dB, -120 = silence) onto the meter scale.
++       */
++      updateLevels(peaks) {
++        if (!Array.isArray(peaks)) {
++          this.levels = [0, 1, 2, 3].map(() => ({db: -120, percent: 0}));
++          return;
++        }
++        this.levels = [0, 1, 2, 3].map((index) => {
++          const db = Number.isFinite(peaks[index]) ? peaks[index] : -120;
++          const percent = Math.max(0, Math.min(1, (db - METER_MIN_DB) / -METER_MIN_DB)) * 100;
++          return {db, percent};
++        });
++      },
++
++      /**
++       * Save channels and gain; the driver applies the gain live and the channels at the next connection.
++       */
++      async save() {
++        this.saving = true;
++        this.message = null;
++        try {
++          const response = await apiFetch('./api/dualsense', {
++            method: 'POST',
++            headers: {'Content-Type': 'application/json'},
++            body: JSON.stringify({
++              gain: Number(this.form.gain),
++              channels: Number(this.form.channels),
++            }),
++          });
++          const result = await response.json();
++          if (response.ok && result.status === true) {
++            this.form = {channels: result.settings.channels, gain: result.settings.gain};
++            this.message = {type: 'success', text: this.i18n.t('dualsense.saved')};
++          } else {
++            this.message = {type: 'danger', text: `${this.i18n.t('dualsense.save_failure')} ${result.error || ''}`.trim()};
++          }
++        } catch (error) {
++          console.error('Failed to save DualSense settings', error);
++          this.message = {type: 'danger', text: this.i18n.t('dualsense.save_failure')};
++        } finally {
++          this.saving = false;
++        }
++      },
++    },
++  }
++</script>
++
++<style scoped>
++  .dualsense-level-label {
++    min-width: 9rem;
++  }
++
++  .dualsense-level-db {
++    min-width: 4.5rem;
++    font-variant-numeric: tabular-nums;
++  }
++</style>
+diff --git a/src_assets/common/assets/web/Navbar.vue b/src_assets/common/assets/web/Navbar.vue
+index 9b8d4fe..d6ae578 100644
+--- a/src_assets/common/assets/web/Navbar.vue
++++ b/src_assets/common/assets/web/Navbar.vue
+@@ -41,6 +41,12 @@
+                 {{ $t('navbar.configuration') }}
+               </RouterLink>
+             </li>
++            <li class="nav-item">
++              <RouterLink class="nav-link" to="/dualsense">
++                <Gamepad2 :size="18" class="icon"></Gamepad2>
++                {{ $t('navbar.dualsense') }}
++              </RouterLink>
++            </li>
+             <li class="nav-item">
+               <RouterLink class="nav-link" to="/troubleshooting">
+                 <Info :size="18" class="icon"></Info>
+@@ -82,7 +88,7 @@
+ </template>
+ 
+ <script>
+-import { CircleUserRound, Home, Info, Layers, Lock, LogOut, Settings, Shield, Star } from '@lucide/vue'
++import { CircleUserRound, Gamepad2, Home, Info, Layers, Lock, LogOut, Settings, Shield, Star } from '@lucide/vue'
+ import ThemeToggle from './ThemeToggle.vue'
+ import Notification from './Notification.vue'
+ 
+@@ -98,6 +104,7 @@ export default {
+     Shield,
+     Info,
+     CircleUserRound,
++    Gamepad2,
+     LogOut
+   },
+   methods: {
+diff --git a/src_assets/common/assets/web/public/assets/locale/en.json b/src_assets/common/assets/web/public/assets/locale/en.json
+index b914ed1..02996bd 100644
+--- a/src_assets/common/assets/web/public/assets/locale/en.json
++++ b/src_assets/common/assets/web/public/assets/locale/en.json
+@@ -528,6 +528,7 @@
+   "navbar": {
+     "applications": "Applications",
+     "configuration": "Configuration",
++    "dualsense": "DualSense",
+     "featured": "Featured Apps",
+     "home": "Home",
+     "logout": "Log Out",
+@@ -602,6 +603,33 @@
+     "resources": "Resources",
+     "third_party_notice": "Third Party Notice"
+   },
++  "dualsense": {
++    "title": "DualSense",
++    "intro": "Haptics and speaker of the virtual DualSense created for Moonlight PlayStation clients (USB/IP).",
++    "status": "Driver status",
++    "attached": "Attached",
++    "detached": "Not attached",
++    "vhci_port": "vhci port",
++    "destination": "Haptics destination",
++    "no_destination": "Not set (driver default)",
++    "channels": "Channels",
++    "gain": "Haptics gain",
++    "packets": "Packets",
++    "level": "Output level",
++    "level_speaker_left": "Speaker L",
++    "level_speaker_right": "Speaker R",
++    "level_haptics_left": "Haptics L",
++    "level_haptics_right": "Haptics R",
++    "settings": "Settings",
++    "channels_2": "2 channels: haptics only",
++    "channels_4": "4 channels: speaker + haptics",
++    "channels_note": "Applied to the next connection.",
++    "gain_note": "Applied live, without reconnecting.",
++    "save": "Save",
++    "saved": "Settings saved.",
++    "save_failure": "Settings could not be saved.",
++    "load_failure": "Could not read the DualSense status."
++  },
+   "troubleshooting": {
+     "permissions_title": "Permissions",
+     "permissions_desc": "Grant the access needed by your Sunshine configuration. Sunshine restarts after it detects all required access.",
+diff --git a/src_assets/common/assets/web/public/assets/locale/fr.json b/src_assets/common/assets/web/public/assets/locale/fr.json
+index 675d2df..9707930 100644
+--- a/src_assets/common/assets/web/public/assets/locale/fr.json
++++ b/src_assets/common/assets/web/public/assets/locale/fr.json
+@@ -527,6 +527,7 @@
+   "navbar": {
+     "applications": "Applications",
+     "configuration": "Configuration",
++    "dualsense": "DualSense",
+     "featured": "Applications en vedette",
+     "home": "Accueil",
+     "logout": "Déconnexion",
+@@ -601,6 +602,33 @@
+     "resources": "Ressources",
+     "third_party_notice": "Avis aux tiers"
+   },
++  "dualsense": {
++    "title": "DualSense",
++    "intro": "Haptiques et haut-parleur de la DualSense virtuelle créée pour les clients Moonlight PlayStation (USB/IP).",
++    "status": "État du pilote",
++    "attached": "Branchée",
++    "detached": "Non branchée",
++    "vhci_port": "Port vhci",
++    "destination": "Destination des haptiques",
++    "no_destination": "Non définie (défaut du pilote)",
++    "channels": "Canaux",
++    "gain": "Gain des haptiques",
++    "packets": "Paquets",
++    "level": "Niveau de sortie",
++    "level_speaker_left": "Haut-parleur G",
++    "level_speaker_right": "Haut-parleur D",
++    "level_haptics_left": "Haptiques G",
++    "level_haptics_right": "Haptiques D",
++    "settings": "Réglages",
++    "channels_2": "2 canaux : haptiques seules",
++    "channels_4": "4 canaux : haut-parleur + haptiques",
++    "channels_note": "Appliqué à la prochaine connexion.",
++    "gain_note": "Appliqué à chaud, sans reconnexion.",
++    "save": "Enregistrer",
++    "saved": "Réglages enregistrés.",
++    "save_failure": "Les réglages n'ont pas pu être enregistrés.",
++    "load_failure": "Impossible de lire l'état de la DualSense."
++  },
+   "troubleshooting": {
+     "permissions_title": "Permissions",
+     "permissions_desc": "Autorisez l'accès nécessaire à votre configuration Sunshine. Sunshine redémarre après avoir détecté tous les accès requis.",
+diff --git a/src_assets/common/assets/web/router.js b/src_assets/common/assets/web/router.js
+index 96873f2..56eff37 100644
+--- a/src_assets/common/assets/web/router.js
++++ b/src_assets/common/assets/web/router.js
+@@ -11,6 +11,7 @@ const routes = [
+   { path: '/apps', component: () => import('./Apps.vue') },
+   { path: '/clients', redirect: '/' },
+   { path: '/config', component: () => import('./Config.vue') },
++  { path: '/dualsense', component: () => import('./DualSense.vue') },
+   { path: '/featured', component: () => import('./Featured.vue') },
+   { path: '/logout', component: () => import('./Logout.vue') },
+   { path: '/password', component: () => import('./Password.vue') },
+-- 
+2.43.0
+

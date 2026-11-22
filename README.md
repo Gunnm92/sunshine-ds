@@ -12,12 +12,19 @@ Le backend USB/IP vient de [ds5-usbip](https://github.com/Gunnm92/ds5-usbip)
 [Sunshine](https://github.com/LizardByte/Sunshine) avec cette version, et
 publie le résultat en release.
 
+Côté Sunshine, deux correctifs sont appliqués au tag (`patches/sunshine/`) :
+
+- `0001` : destination des haptiques automatique (adresse du client Moonlight)
+  et emplacement des fichiers de réglages et d'état ;
+- `0002` : page **DualSense** dans la web UI et API `/api/dualsense`.
+
 ## Contenu d'une release
 
 Une archive à décompresser à la racine du système cible :
 
 - `usr/bin/sunshine` et `usr/share/sunshine/` : Sunshine avec le backend
-  USB/IP (repli automatique sur `uhid` si `vhci-hcd` est absent) ;
+  USB/IP (repli automatique sur `uhid` si `vhci-hcd` est absent) et la page
+  DualSense de la web UI ;
 - `etc/wireplumber/wireplumber.conf.d/52-ds5-usbip.conf` : sortie son de la
   DualSense à 100 % (sinon ses haptiques sont atténuées) et jamais sortie par
   défaut ;
@@ -53,6 +60,12 @@ Arguments (variables `make`, transmises comme `--build-arg`) :
   encore prêt) : passer `REQUIRE_USBIP=0` jusqu'à sa sortie ;
 - `ARGS` : options `docker buildx build` supplémentaires, brutes.
 
+Les patches `patches/sunshine/*.patch` sont appliqués dans l'ordre sur le tag
+Sunshine après les deux `sed` (étape `src`). Un patch qui ne s'applique plus
+arrête le build avec `FATAL: patch <nom> does not apply to Sunshine <tag>`.
+Le build complet exige le patch 0003 de libvirtualhid (champ
+`GamepadMetadata::haptics_destination`).
+
 Le build compile Sunshine avec CUDA : compter plusieurs dizaines de minutes
 hors cache. Les sorties vont dans `out/` :
 `sunshine-ds.tar.zst`, `sunshine-ds.version`, `versions.txt`.
@@ -83,14 +96,49 @@ Lues par la libvirtualhid patchée :
 - `LIBVIRTUALHID_DUALSENSE_USBIP=1` : active le backend USB/IP pour la
   DualSense virtuelle (sinon uhid) ;
 - `LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP=ip:port` : destination RTP des
-  haptiques (canaux 3-4, L16 stéréo 48 kHz, PT 127) ;
+  haptiques (canaux 3-4, L16 stéréo 48 kHz, PT 127). Fixée, elle **force** la
+  destination, quel que soit le client ; sans elle, la destination est
+  automatique (voir ci-dessous) ;
+- `LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT` : port des haptiques quand la
+  destination est automatique (défaut `46100`) ;
+- `LIBVIRTUALHID_DUALSENSE_SETTINGS` : fichier de réglages lu par le pilote,
+  lignes `clé=valeur` (`gain`, `channels`). Défaut au démarrage :
+  `dualsense.conf` dans le dossier de `sunshine.conf` ;
+- `LIBVIRTUALHID_DUALSENSE_STATUS` : fichier d'état JSON réécrit par le pilote
+  (une fois par seconde). Défaut au démarrage : `dualsense-status.json` dans
+  le dossier de `sunshine.conf` ;
 - `LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN` : gain appliqué aux haptiques avant
   envoi (écrêtage doux au-dessus de la demi-échelle) ;
 - `LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN_FILE` : fichier contenant le gain
-- `LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS` : `4` envoie aussi le haut-parleur de la manette (canaux 1-2) ; défaut 2 (haptiques seules).
-  (ex. `2.5`), relu toutes les secondes pour le changer en cours de route ;
+- `LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS` : `4` envoie aussi le haut-parleur de la manette (canaux 1-2) ; défaut 2 (haptiques seules). Valeur par défaut de la page DualSense, remplacée par le fichier de réglages dès qu'il existe ;
 - `LIBVIRTUALHID_VHCI_SYSFS` : racine sysfs de `vhci-hcd` utilisée par les
   tests (défaut `/sys/devices/platform/vhci_hcd.0`).
+
+### Destination automatique des haptiques
+
+Quand `LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP` n'est pas défini, la DualSense
+virtuelle envoie ses haptiques à l'adresse IP du client Moonlight de la
+session, sur le port `LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT` (défaut `46100`).
+Seules les adresses IPv4 sont retenues (`::ffff:a.b.c.d` compte comme IPv4) :
+en IPv6 pur, le pilote garde sa destination par défaut. Une ligne d'information
+indique la destination choisie à chaque création de manette.
+
+### Page DualSense (web UI)
+
+Entrée **DualSense** du menu, à côté de Configuration. Elle affiche :
+
+- l'état du pilote : branchée ou non, port vhci, destination, canaux, gain,
+  nombre de paquets (lus dans `LIBVIRTUALHID_DUALSENSE_STATUS`) ;
+- les niveaux de crête des quatre canaux (haut-parleur G/D, haptiques G/D),
+  rafraîchis chaque seconde ;
+- le réglage des canaux (2 : haptiques seules, 4 : haut-parleur et haptiques ;
+  appliqué à la prochaine connexion) et du gain (0 à 4, appliqué à chaud).
+
+L'API sous-jacente est `GET /api/dualsense` (réglages et état) et
+`POST /api/dualsense` avec `{"gain": F, "channels": 2|4}` (validation : gain
+strictement supérieur à 0 et au plus 64, canaux 2 ou 4 ; écriture atomique du fichier de
+réglages). Comme les autres points de l'API, elles demandent l'authentification
+et le jeton CSRF.
 
 ## Prérequis côté hôte et conteneur
 

@@ -1,0 +1,356 @@
+From d1c7fdb1415d436a65a7f6fabc22197aeea2f4ed Mon Sep 17 00:00:00 2001
+From: Gunnm92 <gunnm44@gmail.com>
+Date: Sun, 22 Nov 2026 23:49:37 +0100
+Subject: [PATCH 1/2] feat(dualsense): destination haptique automatique vers le
+ client Moonlight
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+La DualSense virtuelle reçoit désormais pour destination des haptiques
+l'adresse IP du client Moonlight de la session (port
+LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT, défaut 46100). Une destination
+explicite (LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP) reste prioritaire.
+
+Au démarrage, LIBVIRTUALHID_DUALSENSE_SETTINGS et
+LIBVIRTUALHID_DUALSENSE_STATUS pointent vers dualsense.conf et
+dualsense-status.json, dans le dossier de sunshine.conf.
+
+Dépend du champ GamepadMetadata::haptics_destination de libvirtualhid
+(patch 0003 de ds5-usbip).
+
+Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+
+diff --git a/cmake/compile_definitions/common.cmake b/cmake/compile_definitions/common.cmake
+index 8219564..8375f24 100644
+--- a/cmake/compile_definitions/common.cmake
++++ b/cmake/compile_definitions/common.cmake
+@@ -165,6 +165,8 @@ set(SUNSHINE_TARGET_FILES
+         "${CMAKE_SOURCE_DIR}/src/httpcommon.h"
+         "${CMAKE_SOURCE_DIR}/src/confighttp.cpp"
+         "${CMAKE_SOURCE_DIR}/src/confighttp.h"
++        "${CMAKE_SOURCE_DIR}/src/dualsense_settings.cpp"
++        "${CMAKE_SOURCE_DIR}/src/dualsense_settings.h"
+         "${CMAKE_SOURCE_DIR}/src/compat/moonlight.h"
+         "${CMAKE_SOURCE_DIR}/src/rtsp.cpp"
+         "${CMAKE_SOURCE_DIR}/src/rtsp.h"
+diff --git a/src/dualsense_settings.cpp b/src/dualsense_settings.cpp
+new file mode 100644
+index 0000000..ae429a6
+--- /dev/null
++++ b/src/dualsense_settings.cpp
+@@ -0,0 +1,45 @@
++/**
++ * @file src/dualsense_settings.cpp
++ * @brief Startup environment of the DualSense haptics files (libvirtualhid).
++ */
++// standard includes
++#include <filesystem>
++#include <string>
++#include <string_view>
++
++// lib includes
++#include <lizardbyte/common/env.h>
++
++// local includes
++#include "dualsense_settings.h"
++#include "logging.h"
++
++namespace dualsense {
++
++  namespace {
++    using namespace std::literals;
++
++    constexpr auto settings_env = "LIBVIRTUALHID_DUALSENSE_SETTINGS"sv;  ///< Settings file read by the driver.
++    constexpr auto status_env = "LIBVIRTUALHID_DUALSENSE_STATUS"sv;  ///< Status file written by the driver.
++
++    std::string env_value(std::string_view name) {
++      return lizardbyte::common::get_env(std::string {name});
++    }
++  }  // namespace
++
++  void init_environment(const std::string &config_file) {
++    const auto directory = std::filesystem::path {config_file}.parent_path();
++
++    if (env_value(settings_env).empty()) {
++      const auto path = (directory / "dualsense.conf").string();
++      lizardbyte::common::set_env(std::string {settings_env}, path);
++      BOOST_LOG(info) << "DualSense settings file: "sv << path;
++    }
++    if (env_value(status_env).empty()) {
++      const auto path = (directory / "dualsense-status.json").string();
++      lizardbyte::common::set_env(std::string {status_env}, path);
++      BOOST_LOG(info) << "DualSense status file: "sv << path;
++    }
++  }
++
++}  // namespace dualsense
+diff --git a/src/dualsense_settings.h b/src/dualsense_settings.h
+new file mode 100644
+index 0000000..cee50d1
+--- /dev/null
++++ b/src/dualsense_settings.h
+@@ -0,0 +1,21 @@
++/**
++ * @file src/dualsense_settings.h
++ * @brief DualSense haptics settings and status files shared with libvirtualhid.
++ */
++#pragma once
++
++// standard includes
++#include <string>
++
++namespace dualsense {
++
++  /**
++   * @brief Point the libvirtualhid settings and status files into the Sunshine config directory.
++   * @details Sets LIBVIRTUALHID_DUALSENSE_SETTINGS and LIBVIRTUALHID_DUALSENSE_STATUS when they are unset or empty.
++   * Call before any gamepad is created.
++   *
++   * @param config_file Path of the active sunshine.conf; its directory is the config directory.
++   */
++  void init_environment(const std::string &config_file);
++
++}  // namespace dualsense
+diff --git a/src/input.cpp b/src/input.cpp
+index 860ad57..ad11f29 100644
+--- a/src/input.cpp
++++ b/src/input.cpp
+@@ -326,6 +326,7 @@ namespace input {
+ 
+     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;  ///< Touch port event.
+     platf::feedback_queue_t feedback_queue;  ///< Queue used to deliver controller feedback to the platform backend.
++    std::string client_address;  ///< Moonlight client IP address of the current session; guarded by input_queue_lock.
+ 
+     std::list<std::vector<uint8_t>> input_queue;  ///< Validated input packets waiting for processing.
+     std::mutex input_queue_lock;  ///< Input queue lock.
+@@ -1418,7 +1419,12 @@ namespace input {
+       return -1;
+     }
+ 
+-    if (platf::alloc_gamepad(platf_input, {id, static_cast<std::uint8_t>(client_index)}, arrival, input->feedback_queue)) {
++    platf::gamepad_arrival_t platform_arrival = arrival;
++    {
++      std::lock_guard lock {input->input_queue_lock};
++      platform_arrival.client_address = input->client_address;
++    }
++    if (platf::alloc_gamepad(platf_input, {id, static_cast<std::uint8_t>(client_index)}, platform_arrival, input->feedback_queue)) {
+       free_id(gamepadMask, id);
+       return -1;
+     }
+@@ -2500,6 +2506,14 @@ namespace input {
+     });
+   }
+ 
++  void set_client_address(const std::shared_ptr<input_t> &input, std::string address) {
++    if (!input) {
++      return;
++    }
++    std::lock_guard lock {input->input_queue_lock};
++    input->client_address = std::move(address);
++  }
++
+   /**
+    * @brief Allocate and initialize platform input state for a stream.
+    */
+diff --git a/src/input.h b/src/input.h
+index 3aaa15d..4c9dd1f 100644
+--- a/src/input.h
++++ b/src/input.h
+@@ -10,6 +10,7 @@
+ #include <functional>
+ #include <memory>
+ #include <span>
++#include <string>
+ #include <string_view>
+ #include <vector>
+ 
+@@ -41,6 +42,16 @@ namespace input {
+    */
+   void terminate_gamepads();
+ 
++  /**
++   * @brief Record the Moonlight client address of the stream that owns this input state.
++   *
++   * The address is passed to the platform backend with each controller arrival.
++   *
++   * @param input Stream input state, may be null before the stream starts.
++   * @param address Client IP address printed by the control connection.
++   */
++  void set_client_address(const std::shared_ptr<input_t> &input, std::string address);
++
+   /**
+    * @brief Destroy virtual gamepads retained for one paired client.
+    *
+diff --git a/src/main.cpp b/src/main.cpp
+index 841e5c8..b2e5618 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -34,6 +34,7 @@
+ // local includes
+ #include "confighttp.h"
+ #include "display_device.h"
++#include "dualsense_settings.h"
+ #include "entry_handler.h"
+ #include "globals.h"
+ #include "httpcommon.h"
+@@ -268,6 +269,9 @@ int main(int argc, char *argv[]) {
+   config::log_config_settings(config::modified_config_settings, false);
+   config::modified_config_settings.clear();
+ 
++  // DualSense haptics settings/status files live next to sunshine.conf (before any gamepad is created).
++  dualsense::init_environment(config::sunshine.config_file);
++
+   if (!config::sunshine.cmd.name.empty()) {
+     auto fn = cmd_to_func.find(config::sunshine.cmd.name);
+     if (fn == std::end(cmd_to_func)) {
+diff --git a/src/platform/common.h b/src/platform/common.h
+index de03e7c..f6a2ef2 100644
+--- a/src/platform/common.h
++++ b/src/platform/common.h
+@@ -450,6 +450,7 @@ namespace platf {
+     std::uint8_t type;  ///< Protocol or controller type discriminator.
+     std::uint16_t capabilities;  ///< Capability flags advertised by the controller.
+     std::uint32_t supportedButtons;  ///< Button mask supported by the connected controller.
++    std::string client_address;  ///< IP address of the Moonlight client of the session, empty when unknown.
+   };
+ 
+   /**
+diff --git a/src/platform/virtualhid_input.cpp b/src/platform/virtualhid_input.cpp
+index 854c796..db19ada 100644
+--- a/src/platform/virtualhid_input.cpp
++++ b/src/platform/virtualhid_input.cpp
+@@ -6,6 +6,7 @@
+ // standard includes
+ #include <algorithm>
+ #include <array>
++#include <charconv>
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
+@@ -15,7 +16,9 @@
+ #include <numbers>
+ #include <optional>
+ #include <random>
++#include <string>
+ #include <string_view>
++#include <system_error>
+ #include <utility>
+ 
+ // lib includes
+@@ -247,6 +250,89 @@ namespace platf::virtualhid {
+       return std::format("02:00:00:00:00:{:02x}", id.globalIndex);
+     }
+ 
++    /**
++     * @brief Default UDP port of the DualSense haptics RTP stream on the client.
++     */
++    constexpr std::uint16_t haptics_default_port = 46100;
++
++    /**
++     * @brief Check that a string is a dotted-quad IPv4 address (a.b.c.d, each part 0-255).
++     */
++    bool is_dotted_ipv4(std::string_view text) {
++      int groups = 0;
++      int value = -1;
++      int digits = 0;
++      for (const char c : text) {
++        if (c == '.') {
++          if (value < 0 || ++groups > 3) {
++            return false;
++          }
++          value = -1;
++          digits = 0;
++        } else if (c >= '0' && c <= '9') {
++          value = (value < 0 ? 0 : value) * 10 + (c - '0');
++          if (++digits > 3 || value > 255) {
++            return false;
++          }
++        } else {
++          return false;
++        }
++      }
++      return value >= 0 && groups == 3;
++    }
++
++    /**
++     * @brief IPv4 host of a client address, or an empty string.
++     * @details An IPv4-mapped IPv6 address (::ffff:a.b.c.d) yields a.b.c.d; any other IPv6 address yields nothing.
++     */
++    std::string haptics_ipv4_host(std::string address) {
++      constexpr std::string_view mapped_prefix {"::ffff:"};
++      if (address.starts_with(mapped_prefix)) {
++        address.erase(0, mapped_prefix.size());
++      }
++      return is_dotted_ipv4(address) ? address : std::string {};
++    }
++
++    /**
++     * @brief UDP port of the haptics stream: LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT, or 46100.
++     */
++    std::uint16_t haptics_port() {
++      const auto value = lizardbyte::common::get_env("LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT");
++      if (value.empty()) {
++        return haptics_default_port;
++      }
++
++      std::uint32_t port = 0;
++      const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), port);
++      if (ec == std::errc {} && end == value.data() + value.size() && port >= 1 && port <= 65535) {
++        return static_cast<std::uint16_t>(port);
++      }
++
++      BOOST_LOG(warning) << "Invalid LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT ["sv << value << "], using "sv << haptics_default_port;
++      return haptics_default_port;
++    }
++
++    /**
++     * @brief Haptics destination ("ip:port") for the Moonlight client of the session.
++     * @details An explicit LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP keeps priority: nothing is set and the driver reads it.
++     * @return Destination, or an empty string when the driver should use its own default.
++     */
++    std::string haptics_destination(const std::string &client_address) {
++      if (!lizardbyte::common::get_env("LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP").empty()) {
++        return {};
++      }
++
++      const auto host = haptics_ipv4_host(client_address);
++      if (host.empty()) {
++        BOOST_LOG(info) << "DualSense haptics: no IPv4 client address ["sv << client_address << "], the driver default applies"sv;
++        return {};
++      }
++
++      auto destination = std::format("{}:{}", host, haptics_port());
++      BOOST_LOG(info) << "DualSense haptics destination: "sv << destination << " (Moonlight client)"sv;
++      return destination;
++    }
++
+     lvh::GamepadMetadata gamepad_metadata(const gamepad_id_t &id, const gamepad_arrival_t &metadata, const lvh::DeviceProfile &profile) {
+       lvh::GamepadMetadata result;
+       result.global_index = id.globalIndex;
+@@ -257,6 +343,9 @@ namespace platf::virtualhid {
+       result.has_rgb_led = metadata.capabilities & LI_CCAP_RGB_LED;
+       result.has_battery = metadata.capabilities & LI_CCAP_BATTERY_STATE;
+       result.stable_id = gamepad_stable_id(id, profile);
++      if (profile.gamepad_kind == lvh::GamepadProfileKind::dualsense) {
++        result.haptics_destination = haptics_destination(metadata.client_address);
++      }
+       return result;
+     }
+ 
+diff --git a/src/stream.cpp b/src/stream.cpp
+index a222b40..a6c08ba 100644
+--- a/src/stream.cpp
++++ b/src/stream.cpp
+@@ -707,6 +707,8 @@ namespace stream {
+       rtsp_stream::launch_session_clear(session_p->launch_session_id);
+ 
+       session_p->control.peer = peer;
++      // Moonlight client address: DualSense haptics destination (libvirtualhid, see virtualhid_input.cpp).
++      input::set_client_address(session_p->input, peer_addr);
+ 
+       // Use the local address from the control connection as the source address
+       // for other communications to the client. This is necessary to ensure
+-- 
+2.43.0
+

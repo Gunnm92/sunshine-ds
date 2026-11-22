@@ -5,7 +5,7 @@
 #   base   toolchain CachyOS (même base que SteamBox)
 #   src    Sunshine au tag, libvirtualhid au commit de Sunshine, ds5-usbip ;
 #          apply.sh de ds5-usbip pose le backend USB/IP dans libvirtualhid,
-#          puis les deux patches Sunshine
+#          puis les deux seds Sunshine et les patches de patches/sunshine/
 #   test   tests de libvirtualhid (échec = build en échec)
 #   build  Sunshine compilé avec la libvirtualhid patchée, archive
 #   check  archive installée sur une image fraîche : ldd, backend, web UI
@@ -38,6 +38,8 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg \
 # (Dockerfile.test de ds5-usbip : SDL3 et X11 se configurent via CPM, les
 # dépendances manquantes font échouer la configuration).
 # Les métadonnées (tag, commits) vont dans /meta, lues par build et test.
+# patches/sunshine/*.patch : correctifs Sunshine (DualSense, web UI), appliqués
+# dans l'ordre après les seds ; un patch qui ne s'applique plus casse le build.
 FROM base AS src
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 ARG SUNSHINE_TAG
@@ -49,6 +51,7 @@ RUN --mount=type=cache,target=/var/cache/pacman/pkg \
       python-jinja cuda sunshine \
       clang ninja pkgconf glib2 libevdev libinput sdl2 libx11 libxtst libxcursor \
       libxext libxi libxkbcommon libxrandr libxss vulkan-headers wayland wayland-protocols
+COPY patches/sunshine /patches/sunshine
 RUN set -e; \
     tag="${SUNSHINE_TAG}"; \
     if [ -z "${tag}" ]; then \
@@ -98,6 +101,14 @@ RUN set -e; \
     f=/src/src/stream.cpp; \
     sed -i 's|server->iterate(150ms);|server->iterate(5ms);|' "${f}"; \
     grep -q 'server->iterate(5ms);' "${f}" || { echo "FATAL: patch latence vibrations non appliqué (Sunshine ${tag})"; exit 1; }; \
+    \
+    # Patches sunshine-ds (patches/sunshine, ordre alphabétique = ordre de numérotation).
+    for p in /patches/sunshine/*.patch; do \
+      name=$(basename "${p}"); \
+      git -C /src apply --check "${p}" || { echo "FATAL: patch ${name} does not apply to Sunshine ${tag}"; exit 1; }; \
+      git -C /src apply "${p}"; \
+      echo "patch ${name} appliqué"; \
+    done; \
     echo "libvirtualhid ${lvh} · ds5-usbip ${ds5} (${DS5_USBIP_REF})"
 
 # ── test : tests de libvirtualhid (même configuration et mêmes exclusions que
@@ -177,7 +188,9 @@ RUN set -e; \
     else \
       echo "REQUIRE_USBIP=0 : contrôle du backend USB/IP ignoré"; \
     fi; \
+    grep -a -q /api/dualsense /usr/bin/sunshine || { echo "FATAL: route /api/dualsense absente du binaire (patch 0002)"; exit 1; }; \
     [ -f /usr/share/sunshine/web/index.html ] || { echo "FATAL: web UI absente de l'archive"; exit 1; }; \
+    grep -r -a -q DualSense /usr/share/sunshine/web || { echo "FATAL: page DualSense absente de la web UI (patch 0002)"; exit 1; }; \
     sh -n /usr/lib/sunshine-ds/vhci-permissions; \
     [ -f /etc/wireplumber/wireplumber.conf.d/52-ds5-usbip.conf ] || { echo "FATAL: règle wireplumber absente"; exit 1; }; \
     [ -f /etc/s6-overlay/s6-rc.d/init-sunshine-ds-vhci/up ] || { echo "FATAL: oneshot s6 absent"; exit 1; }; \
