@@ -105,10 +105,10 @@ la release à la place de son étape `sunshine-usb`.
 
 ## État
 
-Projet créé le 22/11/2026. Pipeline de build et de release en place ; le
-backend USB/IP complet attend le patch 0002 de libvirtualhid (`REQUIRE_USBIP=0`
-d'ici là). Plan et avancement : phase 2 de
-[ds5-usbip/docs/plan.md](https://github.com/Gunnm92/ds5-usbip/blob/main/docs/plan.md).
+Validé en direct le 22/11/2026 sur SteamBox : la DualSense USB/IP est créée
+à chaque connexion Moonlight, ses haptiques HD sont reçues sur le client.
+Dernière release : voir les releases GitHub (`make build && make publish`).
+Suivi : [ds5-usbip/docs/plan.md](https://github.com/Gunnm92/ds5-usbip/blob/main/docs/plan.md).
 
 ## Licences
 
