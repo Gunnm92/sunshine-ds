@@ -87,6 +87,7 @@ Lues par la libvirtualhid patchée :
 - `LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN` : gain appliqué aux haptiques avant
   envoi (écrêtage doux au-dessus de la demi-échelle) ;
 - `LIBVIRTUALHID_DUALSENSE_HAPTICS_GAIN_FILE` : fichier contenant le gain
+- `LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS` : `4` envoie aussi le haut-parleur de la manette (canaux 1-2) ; défaut 2 (haptiques seules).
   (ex. `2.5`), relu toutes les secondes pour le changer en cours de route ;
 - `LIBVIRTUALHID_VHCI_SYSFS` : racine sysfs de `vhci-hcd` utilisée par les
   tests (défaut `/sys/devices/platform/vhci_hcd.0`).
