@@ -12,11 +12,16 @@ Le backend USB/IP vient de [ds5-usbip](https://github.com/Gunnm92/ds5-usbip)
 [Sunshine](https://github.com/LizardByte/Sunshine) avec cette version, et
 publie le résultat en release.
 
-Côté Sunshine, deux correctifs sont appliqués au tag (`patches/sunshine/`) :
+Côté Sunshine, trois correctifs sont appliqués au tag (`patches/sunshine/`) :
 
 - `0001` : destination des haptiques automatique (adresse du client Moonlight)
   et emplacement des fichiers de réglages et d'état ;
-- `0002` : page **DualSense** dans la web UI et API `/api/dualsense`.
+- `0002` : page **DualSense** dans la web UI et API `/api/dualsense` ;
+- `0003` : manette recréée au bon type à son arrivée. Sans lui, une manette
+  créée avant le paquet d'arrivée de Moonlight (type inconnu → Xbox) ou
+  gardée d'une connexion précédente restait une Xbox pour un client DualSense,
+  sur plusieurs reconnexions. À proposer en amont (tests unitaires inclus,
+  non exécutés par ce build : `BUILD_TESTS=OFF`).
 
 ## Contenu d'une release
 
