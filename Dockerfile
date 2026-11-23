@@ -191,8 +191,13 @@ RUN set -e; \
     for f in ${files}; do \
       clang-tidy -p /build --quiet \
         --checks='-*,bugprone-use-after-move,clang-diagnostic-*,cppcoreguidelines-narrowing-conversions' \
-        --extra-arg=-Wall --extra-arg=-Wno-unknown-warning-option "/src/${f}" 2>&1 || true; \
+        --extra-arg=-Wall --extra-arg=-Wno-unknown-warning-option \
+        --removed-arg=-mno-direct-extern-access "/src/${f}" 2>&1 || true; \
     done > /out/clang-tidy.txt; \
+    if grep -q 'Error while processing' /out/clang-tidy.txt; then \
+      grep -E 'error:|Error while processing' /out/clang-tidy.txt; \
+      echo "FATAL: clang-tidy n'a pas pu analyser tous les fichiers (option GCC inconnue de clang ?)"; exit 1; \
+    fi; \
     echo "clang-tidy : $(grep -c -E ': (warning|error):' /out/clang-tidy.txt || true) diagnostics (out/clang-tidy.txt)"
 
 # ── check : archive installée sur une image fraîche (dépendances d'exécution
