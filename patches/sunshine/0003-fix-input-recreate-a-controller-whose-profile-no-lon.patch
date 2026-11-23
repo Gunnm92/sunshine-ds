@@ -1,7 +1,7 @@
-From 8ef26a49eaea44389a92af377183db2cc1d76fa0 Mon Sep 17 00:00:00 2001
+From c0559adbc1b304ac2aa8a52367ce944306e87b83 Mon Sep 17 00:00:00 2001
 From: Gunnm92 <gunnm44@gmail.com>
 Date: Mon, 23 Nov 2026 02:26:18 +0100
-Subject: [PATCH] fix(input): recreate a controller whose profile no longer
+Subject: [PATCH 3/3] fix(input): recreate a controller whose profile no longer
  matches its arrival
 
 A virtual gamepad created by the legacy path (controller state packet
@@ -18,16 +18,24 @@ metadata. An identical arrival still rebinds the retained device.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
- src/input.cpp             | 33 ++++++++++++++++++++++++----
- src/input.h               |  3 ++-
- tests/unit/test_input.cpp | 46 +++++++++++++++++++++++++++++++++++++++
- 3 files changed, 77 insertions(+), 5 deletions(-)
+ src/input.cpp             | 31 +++++++++++++++++++++----
+ src/input.h               |  6 +++--
+ tests/unit/test_input.cpp | 49 ++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 78 insertions(+), 8 deletions(-)
 
 diff --git a/src/input.cpp b/src/input.cpp
-index ad11f29..1e2c477 100644
+index ad11f29..7fc975e 100644
 --- a/src/input.cpp
 +++ b/src/input.cpp
-@@ -260,6 +260,14 @@ namespace input {
+@@ -19,6 +19,7 @@ extern "C" {
+ #include <list>
+ #include <memory>
+ #include <mutex>
++#include <optional>
+ #include <span>
+ #include <string>
+ #include <string_view>
+@@ -260,6 +261,14 @@ namespace input {
  
      int id {-1};  ///< Global gamepad slot assigned to this client controller, or -1 when unassigned.
  
@@ -42,15 +50,17 @@ index ad11f29..1e2c477 100644
      // When emulating the HOME button, we may need to artificially release the back button.
      // Afterwards, the gamepad state on sunshine won't match the state on Moonlight.
      // To prevent Sunshine from sending erroneous input data to the active application,
-@@ -1393,15 +1401,27 @@ namespace input {
+@@ -1392,16 +1401,27 @@ namespace input {
+    *
     * @param input Stream input state.
     * @param client_index Client-relative controller index.
-    * @param arrival Client-reported controller metadata.
-+   * @param reported `false` for the legacy path, where @p arrival is empty and the profile a guess.
+-   * @param arrival Client-reported controller metadata.
++   * @param arrival Client-reported controller metadata, or empty for the legacy path (a controller state
++   * packet received before any arrival packet), whose profile is only a default guess.
     * @return Assigned global gamepad slot, or -1 when allocation fails.
     */
 -  int alloc_gamepad(std::shared_ptr<input_t> &input, int client_index, const platf::gamepad_arrival_t &arrival) {
-+  int alloc_gamepad(std::shared_ptr<input_t> &input, int client_index, const platf::gamepad_arrival_t &arrival, bool reported = true) {
++  int alloc_gamepad(std::shared_ptr<input_t> &input, int client_index, const std::optional<platf::gamepad_arrival_t> &arrival) {
      if (client_index < 0 || client_index >= input->gamepads.size()) {
        BOOST_LOG(warning) << "ControllerNumber out of range ["sv << client_index << ']';
        return -1;
@@ -61,8 +71,7 @@ index ad11f29..1e2c477 100644
 +    // retained from a previous connection with another controller type, would keep the
 +    // wrong profile for the whole session (e.g. an Xbox pad for a DualSense client):
 +    // recreate it from the reported metadata instead of rebinding it.
-+    if (gamepad.id >= 0 && reported &&
-+        (!gamepad.arrival || gamepad.arrival->type != arrival.type || gamepad.arrival->capabilities != arrival.capabilities)) {
++    if (gamepad.id >= 0 && arrival && (!gamepad.arrival || gamepad.arrival->type != arrival->type || gamepad.arrival->capabilities != arrival->capabilities)) {
 +      BOOST_LOG(info) << "Recreating controller ["sv << client_index << "] from its arrival metadata"sv
 +                      << (gamepad.arrival ? " (controller type changed)"sv : " (created before arrival)"sv);
 +      ::input::free_gamepad(platf_input, gamepad.id);
@@ -71,59 +80,89 @@ index ad11f29..1e2c477 100644
      if (gamepad.id >= 0) {
        // Resume-time motion requests can arrive before the client assigns this
        // controller slot. Replay them after its arrival, without recreating the
-@@ -1430,6 +1450,11 @@ namespace input {
+@@ -1419,7 +1439,7 @@ namespace input {
+       return -1;
+     }
+ 
+-    platf::gamepad_arrival_t platform_arrival = arrival;
++    auto platform_arrival = arrival.value_or(platf::gamepad_arrival_t {});
+     {
+       std::lock_guard lock {input->input_queue_lock};
+       platform_arrival.client_address = input->client_address;
+@@ -1430,6 +1450,7 @@ namespace input {
      }
  
      gamepad.id = id;
-+    if (reported) {
-+      gamepad.arrival = arrival;
-+    } else {
-+      gamepad.arrival.reset();
-+    }
++    gamepad.arrival = arrival;
      return id;
    }
  
-@@ -1704,7 +1729,7 @@ namespace input {
+@@ -1704,7 +1725,7 @@ namespace input {
      // If this is an event for a new gamepad, create the gamepad now. Ideally, the client would
      // send a controller arrival instead of this but it's still supported for legacy clients.
      if ((packet->activeGamepadMask & (1 << packet->controllerNumber)) && gamepad.id < 0) {
 -      if (alloc_gamepad(input, packet->controllerNumber, {}) < 0) {
-+      if (alloc_gamepad(input, packet->controllerNumber, {}, false) < 0) {
++      if (alloc_gamepad(input, packet->controllerNumber, std::nullopt) < 0) {
          return;
        }
      } else if (!(packet->activeGamepadMask & (1 << packet->controllerNumber)) && gamepad.id >= 0) {
-@@ -2564,8 +2589,8 @@ namespace input {
+@@ -2564,7 +2585,7 @@ namespace input {
        return input->client_context.get();
      }
  
 -    int alloc_gamepad(std::shared_ptr<input_t> &input, std::uint8_t client_index, const platf::gamepad_arrival_t &metadata) {
--      return ::input::alloc_gamepad(input, client_index, metadata);
-+    int alloc_gamepad(std::shared_ptr<input_t> &input, std::uint8_t client_index, const platf::gamepad_arrival_t &metadata, bool reported) {
-+      return ::input::alloc_gamepad(input, client_index, metadata, reported);
++    int alloc_gamepad(std::shared_ptr<input_t> &input, std::uint8_t client_index, const std::optional<platf::gamepad_arrival_t> &metadata) {
+       return ::input::alloc_gamepad(input, client_index, metadata);
      }
  
-     int gamepad_id(const std::shared_ptr<input_t> &input, std::uint8_t client_index) {
 diff --git a/src/input.h b/src/input.h
-index 4c9dd1f..58de5c5 100644
+index 4c9dd1f..cbb67d5 100644
 --- a/src/input.h
 +++ b/src/input.h
-@@ -118,9 +118,10 @@ namespace input {
+@@ -9,6 +9,7 @@
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
++#include <optional>
+ #include <span>
+ #include <string>
+ #include <string_view>
+@@ -117,10 +118,11 @@ namespace input {
+      *
       * @param input Retained input state.
       * @param client_index Client-relative controller index.
-      * @param metadata Client-reported controller metadata.
-+     * @param reported `false` to model the legacy path (state packet before any arrival packet).
+-     * @param metadata Client-reported controller metadata.
++     * @param metadata Client-reported controller metadata, or empty to model the legacy path
++     * (controller state packet before any arrival packet).
       * @return Assigned global gamepad slot, or -1 on failure.
       */
 -    int alloc_gamepad(std::shared_ptr<input_t> &input, std::uint8_t client_index, const platf::gamepad_arrival_t &metadata);
-+    int alloc_gamepad(std::shared_ptr<input_t> &input, std::uint8_t client_index, const platf::gamepad_arrival_t &metadata, bool reported = true);
++    int alloc_gamepad(std::shared_ptr<input_t> &input, std::uint8_t client_index, const std::optional<platf::gamepad_arrival_t> &metadata);
  
      /**
       * @brief Return the global gamepad slot stored for a test controller.
 diff --git a/tests/unit/test_input.cpp b/tests/unit/test_input.cpp
-index b9082da..198a72a 100644
+index b9082da..abce370 100644
 --- a/tests/unit/test_input.cpp
 +++ b/tests/unit/test_input.cpp
-@@ -582,6 +582,52 @@ TEST_F(InputGamepadSessionTest, ReportsMissingRetainedBackendOnArrival) {
+@@ -16,6 +16,7 @@
+ #include <future>
+ #include <limits>
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <thread>
+ #include <vector>
+@@ -513,7 +514,7 @@ TEST_F(InputGamepadSessionTest, ReplaysMotionAndRumbleAfterResumedControllerArri
+   const auto capabilities = static_cast<std::uint16_t>(LI_CCAP_ACCEL | LI_CCAP_GYRO | LI_CCAP_RUMBLE);
+   auto first_mail = std::make_shared<safe::mail_raw_t>();
+   auto stream_input = input::alloc(first_mail, session_id);
+-  const auto id = input::testing::alloc_gamepad(stream_input, 0, {LI_CTYPE_PS, capabilities, 0});
++  const auto id = input::testing::alloc_gamepad(stream_input, 0, platf::gamepad_arrival_t {LI_CTYPE_PS, capabilities, 0});
+   ASSERT_GE(id, 0);
+   auto *adapter = platf::virtualhid::gamepad_adapter_for_testing(context(), id);
+   ASSERT_NE(adapter, nullptr);
+@@ -582,6 +583,52 @@ TEST_F(InputGamepadSessionTest, ReportsMissingRetainedBackendOnArrival) {
    EXPECT_EQ(input::testing::alloc_gamepad(stream_input, 0, metadata), -1);
  }
  
@@ -137,11 +176,11 @@ index b9082da..198a72a 100644
 +  };
 +
 +  // Controller state packet ahead of the arrival packet: default profile.
-+  const auto legacy_id = input::testing::alloc_gamepad(stream_input, 0, {}, false);
++  const auto legacy_id = input::testing::alloc_gamepad(stream_input, 0, std::nullopt);
 +  ASSERT_GE(legacy_id, 0);
 +  EXPECT_EQ(kind(legacy_id), lvh::GamepadProfileKind::xbox_series);
 +
-+  const auto id = input::testing::alloc_gamepad(stream_input, 0, {LI_CTYPE_PS, 0, 0});
++  const auto id = input::testing::alloc_gamepad(stream_input, 0, platf::gamepad_arrival_t {LI_CTYPE_PS, 0, 0});
 +  ASSERT_GE(id, 0);
 +  EXPECT_EQ(input::testing::gamepad_id(stream_input, 0), id);
 +  EXPECT_EQ(kind(id), lvh::GamepadProfileKind::dualsense);
@@ -149,7 +188,7 @@ index b9082da..198a72a 100644
 +
 +  // The same arrival again (resumed connection) keeps the device.
 +  const auto *adapter = platf::virtualhid::gamepad_adapter_for_testing(context(), id);
-+  EXPECT_EQ(input::testing::alloc_gamepad(stream_input, 0, {LI_CTYPE_PS, 0, 0}), id);
++  EXPECT_EQ(input::testing::alloc_gamepad(stream_input, 0, platf::gamepad_arrival_t {LI_CTYPE_PS, 0, 0}), id);
 +  EXPECT_EQ(platf::virtualhid::gamepad_adapter_for_testing(context(), id), adapter);
 +  EXPECT_EQ(runtime().active_device_count(), active_devices + 1);
 +}
@@ -158,13 +197,13 @@ index b9082da..198a72a 100644
 +  config::input.gamepad = "auto";
 +  const std::string session_id = "retained-type-change";
 +  auto first = input::alloc(std::make_shared<safe::mail_raw_t>(), session_id);
-+  const auto xbox_id = input::testing::alloc_gamepad(first, 0, {LI_CTYPE_XBOX, 0, 0});
++  const auto xbox_id = input::testing::alloc_gamepad(first, 0, platf::gamepad_arrival_t {LI_CTYPE_XBOX, 0, 0});
 +  ASSERT_GE(xbox_id, 0);
 +  const auto active_devices = runtime().active_device_count();
 +  first.reset();
 +
 +  auto resumed = input::alloc(std::make_shared<safe::mail_raw_t>(), session_id);
-+  const auto id = input::testing::alloc_gamepad(resumed, 0, {LI_CTYPE_PS, 0, 0});
++  const auto id = input::testing::alloc_gamepad(resumed, 0, platf::gamepad_arrival_t {LI_CTYPE_PS, 0, 0});
 +  ASSERT_GE(id, 0);
 +  const auto *adapter = platf::virtualhid::gamepad_adapter_for_testing(context(), id);
 +  ASSERT_NE(adapter, nullptr);

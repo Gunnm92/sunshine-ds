@@ -8,6 +8,8 @@
 #          puis les deux seds Sunshine et les patches de patches/sunshine/
 #   test   tests de libvirtualhid (échec = build en échec)
 #   build  Sunshine compilé avec la libvirtualhid patchée, archive
+#   unit   tests unitaires de Sunshine (SUNSHINE_TEST_FILTER, échec = build en
+#          échec) et clang-tidy sur les fichiers des patches (rapport out/)
 #   check  archive installée sur une image fraîche : ldd, backend, web UI
 #   collect / scratch : seuls /out/* sortent (make build -> out/)
 #
@@ -18,11 +20,15 @@
 #   REQUIRE_USBIP  1 (défaut) : le binaire doit contenir le backend USB/IP
 #                  (chaîne LIBVIRTUALHID_DUALSENSE_USBIP, patch 0002) ;
 #                  0 tant que ce patch n'est pas prêt.
+#   SUNSHINE_TEST_FILTER  filtre gtest des tests unitaires de Sunshine lancés
+#                  (ceux des patches et des fichiers qu'ils touchent ; les
+#                  autres demandent GPU, écran ou périphériques).
 ARG CACHYOS_BASE=cachyos/cachyos-v3:latest
 ARG SUNSHINE_TAG=""
 ARG DS5_USBIP_REF=main
 ARG LVH_COMMIT=""
 ARG REQUIRE_USBIP=1
+ARG SUNSHINE_TEST_FILTER="DualsenseSettingsTest.*:InputGamepadSessionTest.*:NetworkClassificationTest.*"
 
 # ── Base commune : toolchain + DisableSandboxNetwork (sans lui, pacman refuse
 # les hooks dans une étape de build — voir SteamBox/Dockerfile.prebuilt).
@@ -131,6 +137,8 @@ RUN cmake -S /lvh -B /lvh/build -G Ninja \
 # Flags repris de SteamBox (Dockerfile.prebuilt, étape sunshine-usb), avec
 # -DCPM_libvirtualhid_SOURCE pour utiliser /lvh au lieu de le télécharger.
 # Sortie : /pkg = usr/bin/sunshine (strip) + usr/share/sunshine + overlay/.
+# BUILD_TESTS=ON et compile_commands.json pour l'étape unit ; seule la cible
+# sunshine et la web UI sont compilées ici.
 FROM src AS build
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 COPY overlay /overlay
@@ -140,13 +148,13 @@ RUN set -e; \
     lvh=$(cat /meta/lvh-commit); ds5=$(cat /meta/ds5-usbip-commit); ds5ref=$(cat /meta/ds5-usbip-ref); \
     export BRANCH=master BUILD_VERSION="${ver}" COMMIT="${commit}" \
            CC=gcc CXX=g++ CUDA_PATH=/opt/cuda PATH="/opt/cuda/bin:$PATH" NVCC_CCBIN=/usr/bin/g++; \
-    cmake -S /src -B /build -Wno-dev -D BUILD_DOCS=OFF -D BUILD_WERROR=OFF -D BUILD_TESTS=OFF \
+    cmake -S /src -B /build -Wno-dev -D BUILD_DOCS=OFF -D BUILD_WERROR=OFF -D BUILD_TESTS=ON -D CMAKE_EXPORT_COMPILE_COMMANDS=ON \
       -D CMAKE_BUILD_TYPE=Release -D CMAKE_INSTALL_PREFIX=/usr \
       -D SUNSHINE_EXECUTABLE_PATH=/usr/bin/sunshine -D SUNSHINE_ASSETS_DIR=share/sunshine \
       -D SUNSHINE_PUBLISHER_NAME=LizardByte -D SUNSHINE_PUBLISHER_WEBSITE=https://app.lizardbyte.dev \
       -D SUNSHINE_PUBLISHER_ISSUE_URL=https://app.lizardbyte.dev/support \
       -D CPM_libvirtualhid_SOURCE=/lvh; \
-    cmake --build /build -j "$(nproc)"; \
+    cmake --build /build --target sunshine web-ui -j "$(nproc)"; \
     DESTDIR=/root-install cmake --install /build >/dev/null; \
     [ -f /root-install/usr/share/sunshine/web/index.html ] || { echo "FATAL: web UI absente de l'installation Sunshine ${tag}"; exit 1; }; \
     install -Dm755 -s /build/sunshine /pkg/usr/bin/sunshine; \
@@ -164,6 +172,28 @@ RUN set -e; \
       echo "build           $(date -u +%Y-%m-%dT%H:%MZ)"; \
     } > /out/versions.txt; \
     cat /out/versions.txt
+
+# ── unit : tests unitaires de Sunshine (arbre de build de l'étape build) et
+# clang-tidy sur les fichiers C++ modifiés par les patches. Les tests cassent le
+# build ; clang-tidy produit un rapport (out/clang-tidy.txt, hors release).
+FROM build AS unit
+SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
+ARG SUNSHINE_TEST_FILTER
+RUN --mount=type=cache,id=pacman-unit,target=/var/cache/pacman/pkg \
+    pacman -S --needed --noconfirm --noprogressbar clang
+RUN set -e; \
+    export CC=gcc CXX=g++ CUDA_PATH=/opt/cuda PATH="/opt/cuda/bin:$PATH" NVCC_CCBIN=/usr/bin/g++; \
+    cmake --build /build --target test_sunshine -j "$(nproc)"; \
+    mkdir -p /stamp /out; \
+    (cd /build/tests && ./test_sunshine --gtest_filter="${SUNSHINE_TEST_FILTER}" --gtest_brief=1) | tee /out/unit-tests.txt; \
+    echo "tests unitaires Sunshine OK (${SUNSHINE_TEST_FILTER})" > /stamp/unit-tests.txt; \
+    files=$(sed -n 's|^diff --git a/\(.*\.cpp\) b/.*|\1|p' /patches/sunshine/*.patch | sort -u); \
+    for f in ${files}; do \
+      clang-tidy -p /build --quiet \
+        --checks='-*,bugprone-use-after-move,clang-diagnostic-*,cppcoreguidelines-narrowing-conversions' \
+        --extra-arg=-Wall --extra-arg=-Wno-unknown-warning-option "/src/${f}" 2>&1 || true; \
+    done > /out/clang-tidy.txt; \
+    echo "clang-tidy : $(grep -c -E ': (warning|error):' /out/clang-tidy.txt || true) diagnostics (out/clang-tidy.txt)"
 
 # ── check : archive installée sur une image fraîche (dépendances d'exécution
 # tirées des dépôts). Tout échec casse le build.
@@ -204,7 +234,9 @@ SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 COPY --from=build /out/ /out/
 COPY --from=test /stamp/ /stamp/
 COPY --from=check /stamp/ /stamp/
-RUN test -s /stamp/lvh-tests.txt && test -s /stamp/check.txt && test -s /out/sunshine-ds.tar.zst
+COPY --from=unit /stamp/ /stamp/
+COPY --from=unit /out/unit-tests.txt /out/clang-tidy.txt /out/
+RUN test -s /stamp/lvh-tests.txt && test -s /stamp/check.txt && test -s /stamp/unit-tests.txt && test -s /out/sunshine-ds.tar.zst
 
 FROM scratch
 COPY --from=collect /out/ /

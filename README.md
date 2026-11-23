@@ -14,14 +14,17 @@ publie le résultat en release.
 
 Côté Sunshine, trois correctifs sont appliqués au tag (`patches/sunshine/`) :
 
-- `0001` : destination des haptiques automatique (adresse du client Moonlight)
-  et emplacement des fichiers de réglages et d'état ;
+- `0001` : destination des haptiques automatique (adresse IPv4 du client
+  Moonlight, `dualsense::haptics_destination`) et emplacement des fichiers de
+  réglages et d'état ;
 - `0002` : page **DualSense** dans la web UI et API `/api/dualsense` ;
 - `0003` : manette recréée au bon type à son arrivée. Sans lui, une manette
   créée avant le paquet d'arrivée de Moonlight (type inconnu → Xbox) ou
   gardée d'une connexion précédente restait une Xbox pour un client DualSense,
-  sur plusieurs reconnexions. À proposer en amont (tests unitaires inclus,
-  non exécutés par ce build : `BUILD_TESTS=OFF`).
+  sur plusieurs reconnexions. À proposer en amont.
+
+Chaque correctif apporte ses tests unitaires (`tests/unit/test_dualsense_settings.cpp`,
+`tests/unit/test_input.cpp`), lancés par l'étape `unit` du build.
 
 ## Contenu d'une release
 
@@ -51,6 +54,7 @@ make build                          # dernier tag Sunshine, ds5-usbip sur main
 make build SUNSHINE_TAG=v2026.1122.155624
 make build DS5_USBIP_REF=<branche|tag|commit> LVH_COMMIT=<commit>
 make build REQUIRE_USBIP=0          # sans le contrôle du backend USB/IP
+make build SUNSHINE_TEST_FILTER="InputGamepadSessionTest.*"  # autres tests unitaires
 make clean                          # supprime out/
 ```
 
@@ -76,8 +80,12 @@ hors cache. Les sorties vont dans `out/` :
 `sunshine-ds.tar.zst`, `sunshine-ds.version`, `versions.txt`.
 
 Étapes : `src` (sources figées, patches), `test` (tests de libvirtualhid, un
-échec casse le build), `build` (Sunshine), `check` (archive installée sur une
-image fraîche : `ldd` sans bibliothèque manquante, backend USB/IP, web UI).
+échec casse le build), `build` (Sunshine), `unit` (tests unitaires de Sunshine
+filtrés par `SUNSHINE_TEST_FILTER`, un échec casse le build ; `clang-tidy` sur
+les fichiers des patches, rapport dans `out/clang-tidy.txt`), `check` (archive
+installée sur une image fraîche : `ldd` sans bibliothèque manquante, backend
+USB/IP, web UI). `out/unit-tests.txt` et `out/clang-tidy.txt` ne sont pas
+publiés avec la release.
 
 Docker : `make` appelle `docker-socket-proxy:2375` sans TLS. Les variables
 `DOCKER_TLS_VERIFY` et `DOCKER_CERT_PATH` de la session sont retirées de

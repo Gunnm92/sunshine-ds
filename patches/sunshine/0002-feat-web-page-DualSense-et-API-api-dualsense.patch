@@ -1,7 +1,7 @@
-From 6dad38cd1e043367d3a68890451a0fe425a41f21 Mon Sep 17 00:00:00 2001
+From 4f70520c65b75238f11784fd8bf94c8b9ba6b35a Mon Sep 17 00:00:00 2001
 From: Gunnm92 <gunnm44@gmail.com>
 Date: Sun, 22 Nov 2026 23:49:41 +0100
-Subject: [PATCH 2/2] feat(web): page DualSense et API /api/dualsense
+Subject: [PATCH 2/3] feat(web): page DualSense et API /api/dualsense
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -16,9 +16,21 @@ Content-Transfer-Encoding: 8bit
 - Libellés en anglais (défaut) et en français.
 
 Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+---
+ src/confighttp.cpp                            |  57 ++++-
+ src/dualsense_settings.cpp                    | 202 ++++++++++++++++-
+ src/dualsense_settings.h                      |  22 +-
+ src_assets/common/assets/web/DualSense.vue    | 205 ++++++++++++++++++
+ src_assets/common/assets/web/Navbar.vue       |   9 +-
+ .../assets/web/public/assets/locale/en.json   |  28 +++
+ .../assets/web/public/assets/locale/fr.json   |  28 +++
+ src_assets/common/assets/web/router.js        |   1 +
+ tests/unit/test_dualsense_settings.cpp        |  88 ++++++++
+ 9 files changed, 636 insertions(+), 4 deletions(-)
+ create mode 100644 src_assets/common/assets/web/DualSense.vue
 
 diff --git a/src/confighttp.cpp b/src/confighttp.cpp
-index 7a5f0c6..58cbe80 100644
+index 7a5f0c6..4e0b938 100644
 --- a/src/confighttp.cpp
 +++ b/src/confighttp.cpp
 @@ -48,6 +48,7 @@
@@ -29,7 +41,16 @@ index 7a5f0c6..58cbe80 100644
  #include "file_handler.h"
  #include "globals.h"
  #include "httpcommon.h"
-@@ -2278,6 +2279,59 @@ namespace confighttp {
+@@ -1935,7 +1936,7 @@ namespace confighttp {
+       return;
+     }
+ 
+-    const std::string client_id = get_client_id(request);
++    std::string client_id = get_client_id(request);
+     if (!validate_csrf_token(response, request, client_id)) {
+       return;
+     }
+@@ -2278,6 +2279,58 @@ namespace confighttp {
      send_response(response, output_tree);
    }
  
@@ -73,10 +94,9 @@ index 7a5f0c6..58cbe80 100644
 +
 +    std::stringstream ss;
 +    ss << request->content.rdbuf();
-+    std::string error;
-+    const auto settings = dualsense::save_settings(ss.str(), error);
++    const auto settings = dualsense::save_settings(ss.str());
 +    if (!settings) {
-+      bad_request(response, error);
++      bad_request(response, settings.error());
 +      return;
 +    }
 +
@@ -89,7 +109,7 @@ index 7a5f0c6..58cbe80 100644
    /**
     * @brief Get the current libvirtualhid machine license status.
     *
-@@ -2606,6 +2660,8 @@ namespace confighttp {
+@@ -2606,6 +2659,8 @@ namespace confighttp {
      server.resource["^/api/virtual-input/license$"]["GET"] = getVirtualInputLicense;
      server.resource["^/api/virtual-input/license$"]["POST"] = updateVirtualInputLicense;
      server.resource["^/api/virtual-input/status$"]["GET"] = getVirtualInputStatus;
@@ -99,32 +119,36 @@ index 7a5f0c6..58cbe80 100644
      // static/dynamic resources
      server.resource["^/images/sunshine.ico$"]["GET"] = getFaviconImage;
 diff --git a/src/dualsense_settings.cpp b/src/dualsense_settings.cpp
-index ae429a6..a2a89f7 100644
+index e7258f0..797d9ce 100644
 --- a/src/dualsense_settings.cpp
 +++ b/src/dualsense_settings.cpp
-@@ -1,11 +1,15 @@
+@@ -1,13 +1,17 @@
  /**
   * @file src/dualsense_settings.cpp
-- * @brief Startup environment of the DualSense haptics files (libvirtualhid).
-+ * @brief Settings file, status file and startup environment for the DualSense haptics (libvirtualhid).
+- * @brief Startup environment of the DualSense haptics files (libvirtualhid) and haptics destination.
++ * @brief Settings file, status file and startup environment for the DualSense haptics (libvirtualhid),
++ * and haptics destination.
   */
  // standard includes
-+#include <charconv>
+ #include <charconv>
+ #include <cstdint>
  #include <filesystem>
--#include <string>
-+#include <format>
+ #include <format>
 +#include <fstream>
++#include <mutex>
+ #include <optional>
 +#include <sstream>
+ #include <string>
  #include <string_view>
-+#include <system_error>
- 
- // lib includes
- #include <lizardbyte/common/env.h>
-@@ -21,10 +25,162 @@ namespace dualsense {
+ #include <system_error>
+@@ -28,9 +32,28 @@ namespace dualsense {
  
      constexpr auto settings_env = "LIBVIRTUALHID_DUALSENSE_SETTINGS"sv;  ///< Settings file read by the driver.
      constexpr auto status_env = "LIBVIRTUALHID_DUALSENSE_STATUS"sv;  ///< Status file written by the driver.
 +    constexpr auto channels_env = "LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS"sv;  ///< Default channel count (2 or 4).
+     constexpr auto haptics_rtp_env = "LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP"sv;  ///< Explicit destination, read by the driver.
+     constexpr auto haptics_port_env = "LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT"sv;  ///< UDP port of the client.
+     constexpr std::uint16_t haptics_default_port = 46100;  ///< UDP port of the client by default.
 +    constexpr double gain_default = 1.0;  ///< Gain used when the settings file has none.
 +    constexpr double gain_max = 64.0;  ///< Upper bound of the driver gain (exclusive lower bound 0).
 +
@@ -140,12 +164,15 @@ index ae429a6..a2a89f7 100644
 +      return gain > 0.0 && gain <= gain_max;
 +    }
 +
-+    bool valid_channels(int channels) {
++    bool valid_channels(std::int64_t channels) {
 +      return channels == 2 || channels == 4;
 +    }
  
      std::string env_value(std::string_view name) {
        return lizardbyte::common::get_env(std::string {name});
+@@ -60,6 +83,151 @@ namespace dualsense {
+       BOOST_LOG(warning) << "Invalid "sv << haptics_port_env << " ["sv << text << "], using "sv << haptics_default_port;
+       return haptics_default_port;
      }
 +
 +    std::optional<std::string> read_text(const std::string &path) {
@@ -175,11 +202,8 @@ index ae429a6..a2a89f7 100644
 +     */
 +    settings_t default_settings() {
 +      settings_t settings;
-+      int channels = 0;
-+      const auto text = env_value(channels_env);
-+      const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), channels);
-+      if (ec == std::errc {} && end == text.data() + text.size() && valid_channels(channels)) {
-+        settings.channels = channels;
++      if (const auto channels = parse_number<int>(env_value(channels_env)); channels && valid_channels(*channels)) {
++        settings.channels = *channels;
 +      }
 +      return settings;
 +    }
@@ -209,16 +233,12 @@ index ae429a6..a2a89f7 100644
 +        const auto value = trim(line.substr(eq + 1));
 +
 +        if (key == "gain"sv) {
-+          double gain = 0.0;
-+          const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), gain);
-+          if (ec == std::errc {} && end == value.data() + value.size() && valid_gain(gain)) {
-+            settings.gain = gain;
++          if (const auto gain = parse_number<double>(value); gain && valid_gain(*gain)) {
++            settings.gain = *gain;
 +          }
 +        } else if (key == "channels"sv) {
-+          int channels = 0;
-+          const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), channels);
-+          if (ec == std::errc {} && end == value.data() + value.size() && valid_channels(channels)) {
-+            settings.channels = channels;
++          if (const auto channels = parse_number<int>(value); channels && valid_channels(*channels)) {
++            settings.channels = *channels;
 +          }
 +        }
 +      }
@@ -243,7 +263,7 @@ index ae429a6..a2a89f7 100644
 +    /**
 +     * @brief Write a file through a temporary sibling and rename it over the target.
 +     */
-+    bool write_atomic(const std::string &path, const std::string &content, std::string &error) {
++    std::expected<void, std::string> write_atomic(const std::string &path, const std::string &content) {
 +      const auto target = std::filesystem::path {path};
 +      const auto temporary = std::filesystem::path {path + ".tmp"};
 +      {
@@ -251,21 +271,20 @@ index ae429a6..a2a89f7 100644
 +        out << content;
 +        out.flush();
 +        if (!out) {
-+          error = "Cannot write the DualSense settings file";
 +          std::error_code ec;
 +          std::filesystem::remove(temporary, ec);
-+          return false;
++          return std::unexpected {"Cannot write the DualSense settings file"s};
 +        }
 +      }
 +
 +      std::error_code ec;
 +      std::filesystem::rename(temporary, target, ec);
 +      if (ec) {
-+        error = "Cannot replace the DualSense settings file: "s + ec.message();
++        auto error = "Cannot replace the DualSense settings file: "s + ec.message();
 +        std::filesystem::remove(temporary, ec);
-+        return false;
++        return std::unexpected {std::move(error)};
 +      }
-+      return true;
++      return {};
 +    }
 +
 +    /**
@@ -280,11 +299,31 @@ index ae429a6..a2a89f7 100644
 +      auto status = nlohmann::json::parse(*text, nullptr, false);
 +      return status.is_object() ? status : fallback;
 +    }
++
++    /**
++     * @brief Settings from a request body, or a client-facing message.
++     */
++    std::expected<settings_t, std::string> parse_request(const std::string &body) {
++      const auto request = nlohmann::json::parse(body, nullptr, false);
++      if (request.is_discarded() || !request.is_object()) {
++        return std::unexpected {"Invalid JSON body"s};
++      }
++
++      const auto gain_it = request.find("gain");
++      if (gain_it == request.end() || !gain_it->is_number() || !valid_gain(gain_it->get<double>())) {
++        return std::unexpected {"gain must be a number greater than 0 and at most 64"s};
++      }
++      const auto channels_it = request.find("channels");
++      if (channels_it == request.end() || !channels_it->is_number_integer() || !valid_channels(channels_it->get<std::int64_t>())) {
++        return std::unexpected {"channels must be 2 or 4"s};
++      }
++      return settings_t {gain_it->get<double>(), static_cast<int>(channels_it->get<std::int64_t>())};
++    }
    }  // namespace
  
    void init_environment(const std::string &config_file) {
-@@ -42,4 +198,57 @@ namespace dualsense {
-     }
+@@ -94,4 +262,36 @@ namespace dualsense {
+     return destination;
    }
  
 +  nlohmann::json get_state() {
@@ -296,65 +335,45 @@ index ae429a6..a2a89f7 100644
 +    return state;
 +  }
 +
-+  std::optional<nlohmann::json> save_settings(const std::string &body, std::string &error) {
-+    const auto request = nlohmann::json::parse(body, nullptr, false);
-+    if (request.is_discarded() || !request.is_object()) {
-+      error = "Invalid JSON body";
-+      return std::nullopt;
-+    }
-+
-+    const auto gain_it = request.find("gain");
-+    if (gain_it == request.end() || !gain_it->is_number()) {
-+      error = "gain must be a number";
-+      return std::nullopt;
-+    }
-+    settings_t settings;
-+    settings.gain = gain_it->get<double>();
-+    if (!valid_gain(settings.gain)) {
-+      error = "gain must be greater than 0 and at most 64";
-+      return std::nullopt;
-+    }
-+
-+    const auto channels_it = request.find("channels");
-+    if (channels_it == request.end() || !channels_it->is_number_integer()) {
-+      error = "channels must be 2 or 4";
-+      return std::nullopt;
-+    }
-+    settings.channels = channels_it->get<int>();
-+    if (!valid_channels(settings.channels)) {
-+      error = "channels must be 2 or 4";
-+      return std::nullopt;
++  std::expected<nlohmann::json, std::string> save_settings(const std::string &body) {
++    const auto settings = parse_request(body);
++    if (!settings) {
++      return std::unexpected {settings.error()};
 +    }
 +
 +    const auto path = env_value(settings_env);
 +    if (path.empty()) {
-+      error = "LIBVIRTUALHID_DUALSENSE_SETTINGS is not set";
-+      return std::nullopt;
-+    }
-+    if (!write_atomic(path, render_settings(settings), error)) {
-+      BOOST_LOG(warning) << "DualSense settings: "sv << error;
-+      return std::nullopt;
++      return std::unexpected {"LIBVIRTUALHID_DUALSENSE_SETTINGS is not set"s};
 +    }
 +
-+    BOOST_LOG(info) << "DualSense settings saved: gain="sv << settings.gain << " channels="sv << settings.channels;
-+    return nlohmann::json {{"gain", settings.gain}, {"channels", settings.channels}};
++    // Concurrent requests share the temporary file: write them one at a time.
++    static std::mutex write_mutex;
++    std::lock_guard lock {write_mutex};
++    if (const auto written = write_atomic(path, render_settings(*settings)); !written) {
++      BOOST_LOG(warning) << "DualSense settings: "sv << written.error();
++      return std::unexpected {written.error()};
++    }
++
++    BOOST_LOG(info) << "DualSense settings saved: gain="sv << settings->gain << " channels="sv << settings->channels;
++    return nlohmann::json {{"gain", settings->gain}, {"channels", settings->channels}};
 +  }
 +
  }  // namespace dualsense
 diff --git a/src/dualsense_settings.h b/src/dualsense_settings.h
-index cee50d1..f961d55 100644
+index 5ca8d8c..c913c1a 100644
 --- a/src/dualsense_settings.h
 +++ b/src/dualsense_settings.h
-@@ -1,12 +1,16 @@
+@@ -1,12 +1,17 @@
  /**
   * @file src/dualsense_settings.h
-- * @brief DualSense haptics settings and status files shared with libvirtualhid.
-+ * @brief DualSense haptics settings and status shared with libvirtualhid, for the Web UI "DualSense" page.
+- * @brief DualSense haptics settings and status files shared with libvirtualhid, and the haptics destination.
++ * @brief DualSense haptics settings and status shared with libvirtualhid, for the Web UI "DualSense" page,
++ * and the haptics destination.
   */
  #pragma once
  
  // standard includes
-+#include <optional>
++#include <expected>
  #include <string>
  
 +// lib includes
@@ -363,9 +382,9 @@ index cee50d1..f961d55 100644
  namespace dualsense {
  
    /**
-@@ -18,4 +22,20 @@ namespace dualsense {
+@@ -29,4 +34,19 @@ namespace dualsense {
     */
-   void init_environment(const std::string &config_file);
+   std::string haptics_destination(const std::string &client_address);
  
 +  /**
 +   * @brief Current settings (file or defaults) and the driver status (file or detached).
@@ -378,10 +397,9 @@ index cee50d1..f961d55 100644
 +   * @brief Validate a settings request and rewrite the settings file atomically.
 +   *
 +   * @param body JSON body: {"gain": F, "channels": 2|4}.
-+   * @param error Set to a client-facing message when the request is refused.
-+   * @return The saved settings, or std::nullopt when refused or the file cannot be written.
++   * @return The saved settings, or a client-facing message when the request is refused or the file cannot be written.
 +   */
-+  std::optional<nlohmann::json> save_settings(const std::string &body, std::string &error);
++  std::expected<nlohmann::json, std::string> save_settings(const std::string &body);
 +
  }  // namespace dualsense
 diff --git a/src_assets/common/assets/web/DualSense.vue b/src_assets/common/assets/web/DualSense.vue
@@ -733,6 +751,135 @@ index 96873f2..56eff37 100644
    { path: '/featured', component: () => import('./Featured.vue') },
    { path: '/logout', component: () => import('./Logout.vue') },
    { path: '/password', component: () => import('./Password.vue') },
+diff --git a/tests/unit/test_dualsense_settings.cpp b/tests/unit/test_dualsense_settings.cpp
+index e13dd32..86af9c5 100644
+--- a/tests/unit/test_dualsense_settings.cpp
++++ b/tests/unit/test_dualsense_settings.cpp
+@@ -9,8 +9,10 @@
+ // standard includes
+ #include <array>
+ #include <filesystem>
++#include <fstream>
+ #include <optional>
+ #include <string>
++#include <system_error>
+ 
+ // lib includes
+ #include <lizardbyte/common/env.h>
+@@ -30,6 +32,7 @@ namespace {
+       "LIBVIRTUALHID_DUALSENSE_STATUS",
+       "LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP",
+       "LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT",
++      "LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS",
+     };
+ 
+     void SetUp() override {
+@@ -40,6 +43,10 @@ namespace {
+         }
+         lizardbyte::common::unset_env(names[i]);
+       }
++      const auto *test = ::testing::UnitTest::GetInstance()->current_test_info();
++      directory_ = std::filesystem::temp_directory_path() / (std::string {"sunshine-dualsense-"} + test->name());
++      std::filesystem::remove_all(directory_);
++      std::filesystem::create_directories(directory_);
+     }
+ 
+     void TearDown() override {
+@@ -50,9 +57,24 @@ namespace {
+           lizardbyte::common::unset_env(names[i]);
+         }
+       }
++      std::error_code ec;
++      std::filesystem::remove_all(directory_, ec);
++    }
++
++    /**
++     * @brief Point a DualSense file variable to a file of the test directory, written when @p content is given.
++     */
++    std::filesystem::path use_file(const char *name, const std::string &file, const std::optional<std::string> &content = std::nullopt) {
++      const auto path = directory_ / file;
++      lizardbyte::common::set_env(name, path.string());
++      if (content) {
++        std::ofstream {path, std::ios::binary} << *content;
++      }
++      return path;
+     }
+ 
+   private:
++    std::filesystem::path directory_;
+     std::array<std::optional<std::string>, names.size()> saved_ {};
+   };
+ 
+@@ -102,3 +124,69 @@ TEST_F(DualsenseSettingsTest, HapticsDestinationDefersToAnExplicitDestination) {
+ 
+   EXPECT_EQ(dualsense::haptics_destination("10.10.10.1"), "");
+ }
++
++TEST_F(DualsenseSettingsTest, SaveSettingsWritesAFileReadBackByGetState) {
++  const auto path = use_file("LIBVIRTUALHID_DUALSENSE_SETTINGS", "dualsense.conf");
++
++  const auto saved = dualsense::save_settings(R"({"gain": 1.5, "channels": 4})");
++
++  ASSERT_TRUE(saved) << saved.error();
++  EXPECT_EQ(*saved, (nlohmann::json {{"gain", 1.5}, {"channels", 4}}));
++  EXPECT_TRUE(std::filesystem::exists(path));
++  EXPECT_FALSE(std::filesystem::exists(path.string() + ".tmp"));
++  EXPECT_EQ(dualsense::get_state()["settings"], *saved);
++}
++
++TEST_F(DualsenseSettingsTest, SaveSettingsRefusesInvalidRequests) {
++  const auto path = use_file("LIBVIRTUALHID_DUALSENSE_SETTINGS", "dualsense.conf");
++
++  for (const auto *body : {
++         "not json",
++         "[1, 4]",
++         R"({"channels": 4})",
++         R"({"gain": 0, "channels": 4})",
++         R"({"gain": 64.5, "channels": 4})",
++         R"({"gain": "1", "channels": 4})",
++         R"({"gain": 1})",
++         R"({"gain": 1, "channels": 3})",
++         R"({"gain": 1, "channels": 2.0})",
++         R"({"gain": 1, "channels": 4294967298})",
++       }) {
++    const auto saved = dualsense::save_settings(body);
++    ASSERT_FALSE(saved) << body;
++    EXPECT_FALSE(saved.error().empty()) << body;
++  }
++  EXPECT_FALSE(std::filesystem::exists(path));
++}
++
++TEST_F(DualsenseSettingsTest, SaveSettingsNeedsTheSettingsFileVariable) {
++  const auto saved = dualsense::save_settings(R"({"gain": 1, "channels": 2})");
++
++  ASSERT_FALSE(saved);
++  EXPECT_EQ(saved.error(), "LIBVIRTUALHID_DUALSENSE_SETTINGS is not set");
++}
++
++TEST_F(DualsenseSettingsTest, GetStateFallsBackPerKeyAndToTheChannelDefault) {
++  lizardbyte::common::set_env("LIBVIRTUALHID_DUALSENSE_RTP_CHANNELS", "4");
++  EXPECT_EQ(dualsense::get_state()["settings"], (nlohmann::json {{"gain", 1.0}, {"channels", 4}}));
++
++  use_file("LIBVIRTUALHID_DUALSENSE_SETTINGS", "dualsense.conf", "# comment\ngain = abc\nchannels = 2\nno separator\nunknown=1\n");
++  EXPECT_EQ(dualsense::get_state()["settings"], (nlohmann::json {{"gain", 1.0}, {"channels", 2}}));
++
++  use_file("LIBVIRTUALHID_DUALSENSE_SETTINGS", "dualsense.conf", "gain=2.5\nchannels=3\n");
++  EXPECT_EQ(dualsense::get_state()["settings"], (nlohmann::json {{"gain", 2.5}, {"channels", 4}}));
++}
++
++TEST_F(DualsenseSettingsTest, GetStateReportsTheDriverStatusOrDetached) {
++  const nlohmann::json detached {{"attached", false}};
++  EXPECT_EQ(dualsense::get_state()["status"], detached);
++
++  use_file("LIBVIRTUALHID_DUALSENSE_STATUS", "missing.json");
++  EXPECT_EQ(dualsense::get_state()["status"], detached);
++
++  use_file("LIBVIRTUALHID_DUALSENSE_STATUS", "broken.json", "{\"attached\":");
++  EXPECT_EQ(dualsense::get_state()["status"], detached);
++
++  use_file("LIBVIRTUALHID_DUALSENSE_STATUS", "status.json", R"({"attached": true, "vhci_port": 0})");
++  EXPECT_EQ(dualsense::get_state()["status"], (nlohmann::json {{"attached", true}, {"vhci_port", 0}}));
++}
 -- 
 2.43.0
 

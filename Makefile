@@ -14,11 +14,13 @@ SUNSHINE_TAG ?= $(shell git ls-remote --tags --refs https://github.com/LizardByt
 DS5_USBIP_REF ?= $(shell git ls-remote https://github.com/Gunnm92/ds5-usbip.git refs/heads/main | cut -f1)
 LVH_COMMIT ?=
 REQUIRE_USBIP ?=
+SUNSHINE_TEST_FILTER ?=
 BUILD_ARGS := \
   $(if $(SUNSHINE_TAG),--build-arg SUNSHINE_TAG=$(SUNSHINE_TAG)) \
   $(if $(DS5_USBIP_REF),--build-arg DS5_USBIP_REF=$(DS5_USBIP_REF)) \
   $(if $(LVH_COMMIT),--build-arg LVH_COMMIT=$(LVH_COMMIT)) \
-  $(if $(REQUIRE_USBIP),--build-arg REQUIRE_USBIP=$(REQUIRE_USBIP))
+  $(if $(REQUIRE_USBIP),--build-arg REQUIRE_USBIP=$(REQUIRE_USBIP)) \
+  $(if $(SUNSHINE_TEST_FILTER),--build-arg SUNSHINE_TEST_FILTER="$(SUNSHINE_TEST_FILTER)")
 
 .PHONY: build publish clean
 

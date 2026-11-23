@@ -1,7 +1,7 @@
-From d1c7fdb1415d436a65a7f6fabc22197aeea2f4ed Mon Sep 17 00:00:00 2001
+From 9650097bc85556ced480bd1fee7213b89a9718db Mon Sep 17 00:00:00 2001
 From: Gunnm92 <gunnm44@gmail.com>
 Date: Sun, 22 Nov 2026 23:49:37 +0100
-Subject: [PATCH 1/2] feat(dualsense): destination haptique automatique vers le
+Subject: [PATCH 1/3] feat(dualsense): destination haptique automatique vers le
  client Moonlight
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -20,6 +20,21 @@ Dépend du champ GamepadMetadata::haptics_destination de libvirtualhid
 (patch 0003 de ds5-usbip).
 
 Co-Authored-By: Claude Haiku 5.5 <noreply@anthropic.com>
+---
+ cmake/compile_definitions/common.cmake |   2 +
+ src/dualsense_settings.cpp             |  97 +++++++++++++++++++++++
+ src/dualsense_settings.h               |  32 ++++++++
+ src/input.cpp                          |  16 +++-
+ src/input.h                            |  11 +++
+ src/main.cpp                           |   4 +
+ src/platform/common.h                  |   1 +
+ src/platform/virtualhid_input.cpp      |   4 +
+ src/stream.cpp                         |   2 +
+ tests/unit/test_dualsense_settings.cpp | 104 +++++++++++++++++++++++++
+ 10 files changed, 272 insertions(+), 1 deletion(-)
+ create mode 100644 src/dualsense_settings.cpp
+ create mode 100644 src/dualsense_settings.h
+ create mode 100644 tests/unit/test_dualsense_settings.cpp
 
 diff --git a/cmake/compile_definitions/common.cmake b/cmake/compile_definitions/common.cmake
 index 8219564..8375f24 100644
@@ -36,25 +51,32 @@ index 8219564..8375f24 100644
          "${CMAKE_SOURCE_DIR}/src/rtsp.h"
 diff --git a/src/dualsense_settings.cpp b/src/dualsense_settings.cpp
 new file mode 100644
-index 0000000..ae429a6
+index 0000000..e7258f0
 --- /dev/null
 +++ b/src/dualsense_settings.cpp
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,97 @@
 +/**
 + * @file src/dualsense_settings.cpp
-+ * @brief Startup environment of the DualSense haptics files (libvirtualhid).
++ * @brief Startup environment of the DualSense haptics files (libvirtualhid) and haptics destination.
 + */
 +// standard includes
++#include <charconv>
++#include <cstdint>
 +#include <filesystem>
++#include <format>
++#include <optional>
 +#include <string>
 +#include <string_view>
++#include <system_error>
 +
 +// lib includes
++#include <boost/asio/ip/address.hpp>
 +#include <lizardbyte/common/env.h>
 +
 +// local includes
 +#include "dualsense_settings.h"
 +#include "logging.h"
++#include "network.h"
 +
 +namespace dualsense {
 +
@@ -63,9 +85,37 @@ index 0000000..ae429a6
 +
 +    constexpr auto settings_env = "LIBVIRTUALHID_DUALSENSE_SETTINGS"sv;  ///< Settings file read by the driver.
 +    constexpr auto status_env = "LIBVIRTUALHID_DUALSENSE_STATUS"sv;  ///< Status file written by the driver.
++    constexpr auto haptics_rtp_env = "LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP"sv;  ///< Explicit destination, read by the driver.
++    constexpr auto haptics_port_env = "LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT"sv;  ///< UDP port of the client.
++    constexpr std::uint16_t haptics_default_port = 46100;  ///< UDP port of the client by default.
 +
 +    std::string env_value(std::string_view name) {
 +      return lizardbyte::common::get_env(std::string {name});
++    }
++
++    /**
++     * @brief Parse a whole string as a number, without leading spaces or trailing characters.
++     */
++    template<typename T>
++    std::optional<T> parse_number(std::string_view text) {
++      T value {};
++      const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
++      if (ec != std::errc {} || end != text.data() + text.size()) {
++        return std::nullopt;
++      }
++      return value;
++    }
++
++    std::uint16_t haptics_port() {
++      const auto text = env_value(haptics_port_env);
++      if (text.empty()) {
++        return haptics_default_port;
++      }
++      if (const auto port = parse_number<std::uint16_t>(text); port && *port != 0) {
++        return *port;
++      }
++      BOOST_LOG(warning) << "Invalid "sv << haptics_port_env << " ["sv << text << "], using "sv << haptics_default_port;
++      return haptics_default_port;
 +    }
 +  }  // namespace
 +
@@ -84,16 +134,33 @@ index 0000000..ae429a6
 +    }
 +  }
 +
++  std::string haptics_destination(const std::string &client_address) {
++    if (!env_value(haptics_rtp_env).empty()) {
++      return {};
++    }
++
++    boost::system::error_code ec;
++    const auto address = net::normalize_address(boost::asio::ip::make_address(client_address, ec));
++    if (ec || !address.is_v4()) {
++      BOOST_LOG(info) << "DualSense haptics: no IPv4 client address ["sv << client_address << "], the driver default applies"sv;
++      return {};
++    }
++
++    auto destination = std::format("{}:{}", address.to_string(), haptics_port());
++    BOOST_LOG(info) << "DualSense haptics destination: "sv << destination << " (Moonlight client)"sv;
++    return destination;
++  }
++
 +}  // namespace dualsense
 diff --git a/src/dualsense_settings.h b/src/dualsense_settings.h
 new file mode 100644
-index 0000000..cee50d1
+index 0000000..5ca8d8c
 --- /dev/null
 +++ b/src/dualsense_settings.h
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,32 @@
 +/**
 + * @file src/dualsense_settings.h
-+ * @brief DualSense haptics settings and status files shared with libvirtualhid.
++ * @brief DualSense haptics settings and status files shared with libvirtualhid, and the haptics destination.
 + */
 +#pragma once
 +
@@ -110,6 +177,17 @@ index 0000000..cee50d1
 +   * @param config_file Path of the active sunshine.conf; its directory is the config directory.
 +   */
 +  void init_environment(const std::string &config_file);
++
++  /**
++   * @brief Haptics RTP destination ("ip:port") for the Moonlight client of the session.
++   * @details The port is LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT, or 46100. An IPv4-mapped IPv6 address
++   * yields its IPv4 form. An explicit LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP keeps priority.
++   *
++   * @param client_address Client IP address of the session.
++   * @return Destination, or an empty string when the driver should use its own default
++   * (explicit destination set, or no IPv4 client address).
++   */
++  std::string haptics_destination(const std::string &client_address);
 +
 +}  // namespace dualsense
 diff --git a/src/input.cpp b/src/input.cpp
@@ -217,123 +295,23 @@ index de03e7c..f6a2ef2 100644
  
    /**
 diff --git a/src/platform/virtualhid_input.cpp b/src/platform/virtualhid_input.cpp
-index 854c796..db19ada 100644
+index 854c796..0ba1c35 100644
 --- a/src/platform/virtualhid_input.cpp
 +++ b/src/platform/virtualhid_input.cpp
-@@ -6,6 +6,7 @@
- // standard includes
- #include <algorithm>
- #include <array>
-+#include <charconv>
- #include <cmath>
- #include <cstddef>
- #include <cstdint>
-@@ -15,7 +16,9 @@
- #include <numbers>
- #include <optional>
- #include <random>
-+#include <string>
- #include <string_view>
-+#include <system_error>
- #include <utility>
+@@ -23,6 +23,7 @@
  
- // lib includes
-@@ -247,6 +250,89 @@ namespace platf::virtualhid {
-       return std::format("02:00:00:00:00:{:02x}", id.globalIndex);
-     }
+ // local includes
+ #include "src/config.h"
++#include "src/dualsense_settings.h"
+ #include "src/logging.h"
+ #include "virtualhid_input.h"
  
-+    /**
-+     * @brief Default UDP port of the DualSense haptics RTP stream on the client.
-+     */
-+    constexpr std::uint16_t haptics_default_port = 46100;
-+
-+    /**
-+     * @brief Check that a string is a dotted-quad IPv4 address (a.b.c.d, each part 0-255).
-+     */
-+    bool is_dotted_ipv4(std::string_view text) {
-+      int groups = 0;
-+      int value = -1;
-+      int digits = 0;
-+      for (const char c : text) {
-+        if (c == '.') {
-+          if (value < 0 || ++groups > 3) {
-+            return false;
-+          }
-+          value = -1;
-+          digits = 0;
-+        } else if (c >= '0' && c <= '9') {
-+          value = (value < 0 ? 0 : value) * 10 + (c - '0');
-+          if (++digits > 3 || value > 255) {
-+            return false;
-+          }
-+        } else {
-+          return false;
-+        }
-+      }
-+      return value >= 0 && groups == 3;
-+    }
-+
-+    /**
-+     * @brief IPv4 host of a client address, or an empty string.
-+     * @details An IPv4-mapped IPv6 address (::ffff:a.b.c.d) yields a.b.c.d; any other IPv6 address yields nothing.
-+     */
-+    std::string haptics_ipv4_host(std::string address) {
-+      constexpr std::string_view mapped_prefix {"::ffff:"};
-+      if (address.starts_with(mapped_prefix)) {
-+        address.erase(0, mapped_prefix.size());
-+      }
-+      return is_dotted_ipv4(address) ? address : std::string {};
-+    }
-+
-+    /**
-+     * @brief UDP port of the haptics stream: LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT, or 46100.
-+     */
-+    std::uint16_t haptics_port() {
-+      const auto value = lizardbyte::common::get_env("LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT");
-+      if (value.empty()) {
-+        return haptics_default_port;
-+      }
-+
-+      std::uint32_t port = 0;
-+      const auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), port);
-+      if (ec == std::errc {} && end == value.data() + value.size() && port >= 1 && port <= 65535) {
-+        return static_cast<std::uint16_t>(port);
-+      }
-+
-+      BOOST_LOG(warning) << "Invalid LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT ["sv << value << "], using "sv << haptics_default_port;
-+      return haptics_default_port;
-+    }
-+
-+    /**
-+     * @brief Haptics destination ("ip:port") for the Moonlight client of the session.
-+     * @details An explicit LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP keeps priority: nothing is set and the driver reads it.
-+     * @return Destination, or an empty string when the driver should use its own default.
-+     */
-+    std::string haptics_destination(const std::string &client_address) {
-+      if (!lizardbyte::common::get_env("LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP").empty()) {
-+        return {};
-+      }
-+
-+      const auto host = haptics_ipv4_host(client_address);
-+      if (host.empty()) {
-+        BOOST_LOG(info) << "DualSense haptics: no IPv4 client address ["sv << client_address << "], the driver default applies"sv;
-+        return {};
-+      }
-+
-+      auto destination = std::format("{}:{}", host, haptics_port());
-+      BOOST_LOG(info) << "DualSense haptics destination: "sv << destination << " (Moonlight client)"sv;
-+      return destination;
-+    }
-+
-     lvh::GamepadMetadata gamepad_metadata(const gamepad_id_t &id, const gamepad_arrival_t &metadata, const lvh::DeviceProfile &profile) {
-       lvh::GamepadMetadata result;
-       result.global_index = id.globalIndex;
-@@ -257,6 +343,9 @@ namespace platf::virtualhid {
+@@ -257,6 +258,9 @@ namespace platf::virtualhid {
        result.has_rgb_led = metadata.capabilities & LI_CCAP_RGB_LED;
        result.has_battery = metadata.capabilities & LI_CCAP_BATTERY_STATE;
        result.stable_id = gamepad_stable_id(id, profile);
 +      if (profile.gamepad_kind == lvh::GamepadProfileKind::dualsense) {
-+        result.haptics_destination = haptics_destination(metadata.client_address);
++        result.haptics_destination = dualsense::haptics_destination(metadata.client_address);
 +      }
        return result;
      }
@@ -351,6 +329,116 @@ index a222b40..a6c08ba 100644
  
        // Use the local address from the control connection as the source address
        // for other communications to the client. This is necessary to ensure
+diff --git a/tests/unit/test_dualsense_settings.cpp b/tests/unit/test_dualsense_settings.cpp
+new file mode 100644
+index 0000000..e13dd32
+--- /dev/null
++++ b/tests/unit/test_dualsense_settings.cpp
+@@ -0,0 +1,104 @@
++/**
++ * @file tests/unit/test_dualsense_settings.cpp
++ * @brief Test src/dualsense_settings.*
++ */
++
++// test includes
++#include "../tests_common.h"
++
++// standard includes
++#include <array>
++#include <filesystem>
++#include <optional>
++#include <string>
++
++// lib includes
++#include <lizardbyte/common/env.h>
++
++// local includes
++#include <src/dualsense_settings.h>
++
++namespace {
++
++  /**
++   * @brief Restore the DualSense environment variables touched by a test.
++   */
++  class DualsenseSettingsTest: public ::testing::Test {
++  protected:
++    static constexpr std::array names {
++      "LIBVIRTUALHID_DUALSENSE_SETTINGS",
++      "LIBVIRTUALHID_DUALSENSE_STATUS",
++      "LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP",
++      "LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT",
++    };
++
++    void SetUp() override {
++      for (std::size_t i = 0; i < names.size(); ++i) {
++        std::string value;
++        if (lizardbyte::common::get_env(names[i], value)) {
++          saved_[i] = value;
++        }
++        lizardbyte::common::unset_env(names[i]);
++      }
++    }
++
++    void TearDown() override {
++      for (std::size_t i = 0; i < names.size(); ++i) {
++        if (saved_[i]) {
++          lizardbyte::common::set_env(names[i], *saved_[i]);
++        } else {
++          lizardbyte::common::unset_env(names[i]);
++        }
++      }
++    }
++
++  private:
++    std::array<std::optional<std::string>, names.size()> saved_ {};
++  };
++
++}  // namespace
++
++TEST_F(DualsenseSettingsTest, InitEnvironmentPointsUnsetFilesIntoTheConfigDirectory) {
++  const std::filesystem::path directory {"config"};
++  dualsense::init_environment((directory / "sunshine.conf").string());
++
++  EXPECT_EQ(lizardbyte::common::get_env("LIBVIRTUALHID_DUALSENSE_SETTINGS"), (directory / "dualsense.conf").string());
++  EXPECT_EQ(lizardbyte::common::get_env("LIBVIRTUALHID_DUALSENSE_STATUS"), (directory / "dualsense-status.json").string());
++}
++
++TEST_F(DualsenseSettingsTest, InitEnvironmentKeepsExplicitFiles) {
++  const std::filesystem::path directory {"config"};
++  lizardbyte::common::set_env("LIBVIRTUALHID_DUALSENSE_SETTINGS", "custom.conf");
++
++  dualsense::init_environment((directory / "sunshine.conf").string());
++
++  EXPECT_EQ(lizardbyte::common::get_env("LIBVIRTUALHID_DUALSENSE_SETTINGS"), "custom.conf");
++  EXPECT_EQ(lizardbyte::common::get_env("LIBVIRTUALHID_DUALSENSE_STATUS"), (directory / "dualsense-status.json").string());
++}
++
++TEST_F(DualsenseSettingsTest, HapticsDestinationUsesTheIpv4ClientAddress) {
++  EXPECT_EQ(dualsense::haptics_destination("10.10.10.1"), "10.10.10.1:46100");
++  EXPECT_EQ(dualsense::haptics_destination("::ffff:10.10.10.1"), "10.10.10.1:46100");
++}
++
++TEST_F(DualsenseSettingsTest, HapticsDestinationLeavesOtherAddressesToTheDriver) {
++  for (const auto *address : {"", "fe80::1", "2001:db8::1", "10.10.10", "10.10.10.256", "host.lan"}) {
++    EXPECT_EQ(dualsense::haptics_destination(address), "") << address;
++  }
++}
++
++TEST_F(DualsenseSettingsTest, HapticsDestinationUsesAValidPortOverride) {
++  lizardbyte::common::set_env("LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT", "47000");
++  EXPECT_EQ(dualsense::haptics_destination("10.10.10.1"), "10.10.10.1:47000");
++
++  for (const auto *port : {"0", "65536", "-1", "47000x", " 47000"}) {
++    lizardbyte::common::set_env("LIBVIRTUALHID_DUALSENSE_HAPTICS_PORT", port);
++    EXPECT_EQ(dualsense::haptics_destination("10.10.10.1"), "10.10.10.1:46100") << port;
++  }
++}
++
++TEST_F(DualsenseSettingsTest, HapticsDestinationDefersToAnExplicitDestination) {
++  lizardbyte::common::set_env("LIBVIRTUALHID_DUALSENSE_HAPTICS_RTP", "192.0.2.5:5000");
++
++  EXPECT_EQ(dualsense::haptics_destination("10.10.10.1"), "");
++}
 -- 
 2.43.0
 
